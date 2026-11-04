@@ -2534,6 +2534,29 @@ def main():
         usage()
         return
     cmd, args = argv[0], argv[1:]
+    # -j/--jobs may be given before or after the command
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-j", "--jobs") and i + 1 < len(args):
+            try:
+                jobs = int(args[i + 1])
+            except ValueError:
+                die("bad value for %s: %s" % (a, args[i + 1]))
+            i += 2
+            continue
+        if a.startswith("--jobs="):
+            jobs = int(a.split("=", 1)[1])
+            i += 1
+            continue
+        if a.startswith("-j") and a[2:].isdigit():
+            jobs = int(a[2:])
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    args = rest
     ctx = Ctx(dry=dry)
     if jobs is not None:
         ctx.jobs = max(1, jobs)
