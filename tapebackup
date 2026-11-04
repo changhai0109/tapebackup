@@ -485,11 +485,18 @@ class Ctx:
             rc1 = rc1 or rcv
         return rc1, rc2
 
-    def stream_read(self, dest, paths=()):
-        """ssh dd -> tar -x. Returns (ssh_rc, tar_rc)."""
+    def stream_read(self, dest, paths=(), listfile=None):
+        """ssh dd -> tar -x. Returns (ssh_rc, tar_rc).
+
+        listfile is a NUL-separated member list (avoids argv limits); paths
+        are passed after ``--`` so names starting with '-' are safe."""
         dd = "sudo dd if=%s bs=1M iflag=fullblock 2>/dev/null" % shlex.quote(self.rdev)
         p1 = subprocess.Popen(self.ssh_argv_stream() + [dd], stdout=subprocess.PIPE)
-        cmd = ["tar", "-x", "-b%d" % BS, "-C", dest, "-f", "-"] + list(paths)
+        cmd = ["tar", "-x", "-b%d" % BS, "-C", dest, "-f", "-"]
+        if listfile:
+            cmd += ["--null", "-T", listfile]
+        else:
+            cmd += ["--"] + list(paths)
         p2 = subprocess.Popen(cmd, stdin=p1.stdout)
         p1.stdout.close()
         rc2 = p2.wait()
@@ -829,7 +836,7 @@ def inventory(ctx):
 # ---------------------------------------------------------------- on-tape index blocks
 
 
-def block_dump(ctx, outdir, cid, barcode, fileno, prev):
+def block_dump(ctx, outdir, cid, barcode, fileno, prev, force_status_sid=None):
     """Create TAPEIDX.<fileno>/ content for sessions touching this tape."""
     bdir = os.path.join(outdir, "TAPEIDX.%d" % fileno)
     os.makedirs(bdir, exist_ok=True)
@@ -840,12 +847,18 @@ def block_dump(ctx, outdir, cid, barcode, fileno, prev):
         c.close()
         return None
     q = "SELECT %s FROM sessions WHERE sid IN (%s)"
+    status_expr = "ifnull(status,0)"
+    sparams = []
+    if force_status_sid:
+        status_expr = "CASE WHEN sid=? THEN 1 ELSE ifnull(status,0) END"
+        sparams.append(force_status_sid)
     srow = c.execute(q % ("sid||char(9)||ifnull(host_uuid,'')||char(9)||ifnull(host_name,'')"
                           "||char(9)||ifnull(started,'')||char(9)||ifnull(finished,'')"
-                          "||char(9)||ifnull(status,0)||char(9)||ifnull(paths,'')"
+                          "||char(9)||" + status_expr + "||char(9)||ifnull(paths,'')"
                           "||char(9)||ifnull(est_size,0)||char(9)||ifnull(est_files,0)"
                           "||char(9)||ifnull(run_id,'')||char(9)||ifnull(chunk_seq,'')",
-                          ",".join("?" * len(sids))), sids).fetchall()
+                          ",".join("?" * len(sids))),
+                     sparams + list(sids)).fetchall()
     with open(os.path.join(bdir, "sessions.tsv"), "w") as f:
         for row in srow:
             f.write(row[0] + "\n")
@@ -1411,7 +1424,7 @@ def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
                   " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (sid, ctx.host_uuid, ctx.host_name, now, now,
                    "chunk %d/%d of run %s" % (seq, n_chunks, run_id[:8]),
-                   size, len(chunk_files), 1, run_id, seq))
+                   size, len(chunk_files), 0, run_id, seq))
         c.execute("INSERT INTO session_tapes VALUES(?,?,?,?)", (sid, 1, cid, next_file))
         c.executemany("INSERT OR REPLACE INTO file_index(sid,path,size,mtime)"
                       " VALUES(?,?,?,?)",
@@ -1420,7 +1433,8 @@ def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
         c.close()
 
         blk_no = next_file + 1
-        bdir = block_dump(ctx, tmp, cid, barcode, blk_no, prev_block)
+        bdir = block_dump(ctx, tmp, cid, barcode, blk_no, prev_block,
+                          force_status_sid=sid)
         try:
             if bdir:
                 name = os.path.basename(bdir)
@@ -1431,13 +1445,16 @@ def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
                 else:
                     ctx.tar(["-c", "-C", tmp, name])
         except SystemExit:
-            c = db_open(ctx)
-            c.execute("DELETE FROM file_index WHERE sid=?", (sid,))
-            c.execute("DELETE FROM session_tapes WHERE sid=?", (sid,))
-            c.execute("DELETE FROM sessions WHERE sid=?", (sid,))
-            c.commit()
-            c.close()
+            # keep the rows: the data is on tape and the local index still
+            # knows where it is.  status stays 0 so remove will refuse it.
+            print("WARNING: index block write failed; session %s kept with "
+                  "status=0 (remove will not delete these files)" % sid[:8],
+                  flush=True)
             raise
+        c = db_open(ctx)
+        c.execute("UPDATE sessions SET status=1 WHERE sid=?", (sid,))
+        c.commit()
+        c.close()
         return sid, cid, next_file
     finally:
         subprocess.run(["rm", "-rf", tmp])
@@ -1685,24 +1702,30 @@ def cmd_extract(ctx, args):
         c.close()
         if not rows:
             die("no sessions for run %s" % runid)
-        cur = None
-        for sid_r, tape, fno in rows:
-            if tape != cur:
-                if cur is not None:
-                    ctx.mt_try("offline")
-                    print("insert tape %s, press ENTER: " % tape, end="", flush=True)
-                    sys.stdin.readline()
-                cur = tape
-            ctx.ensure_ready()
-            pos_file(ctx, fno)
-            if ctx.rhost:
-                r1, r2 = ctx.stream_read(dest)
-                if r2 not in (0, 1):
-                    die("tar extract failed (%d) for session %s" % (r2, sid_r[:8]))
-            else:
-                r = ctx.tar(["-x", "-C", dest], check=False)
-                if r.returncode not in (0, 1):
-                    die("tar extract failed (%d)" % r.returncode)
+        ctx.lock()
+        try:
+            cur = None
+            for sid_r, tape, fno in rows:
+                if tape != cur:
+                    if cur is not None:
+                        ctx.mt_try("offline")
+                        print("insert tape %s, press ENTER: " % tape,
+                              end="", flush=True)
+                        sys.stdin.readline()
+                    cur = tape
+                ctx.ensure_ready()
+                pos_file(ctx, fno)
+                if ctx.rhost:
+                    r1, r2 = ctx.stream_read(dest)
+                    if r2 not in (0, 1):
+                        die("tar extract failed (%d) for session %s"
+                            % (r2, sid_r[:8]))
+                else:
+                    r = ctx.tar(["-x", "-C", dest], check=False)
+                    if r.returncode not in (0, 1):
+                        die("tar extract failed (%d)" % r.returncode)
+        finally:
+            ctx.unlock()
         print("extracted run %s into %s" % (runid[:8], dest))
         return
     if sid:
@@ -1903,6 +1926,7 @@ def cmd_erase(ctx, args):
         print("removed %d session(s)/tape row %s (orphan runs cleaned)" % (len(info), cid))
         print("NOTE: other hosts' indexes are not updated; run on each of them:")
         print("      tapebackup forget --tape %s" % cid)
+        invalidate_dir_index(ctx)
         ctx.mt_try("rewind")
     finally:
         ctx.unlock()
@@ -1941,6 +1965,7 @@ def cmd_forget(ctx, args):
     c.commit()
     c.close()
     print("forgot %d session(s) and tape %s from this host's index" % (len(sids), cid))
+    invalidate_dir_index(ctx)
 
 
 def cmd_scan(ctx, args):
@@ -1990,7 +2015,9 @@ def _scan(ctx, args):
     finally:
         subprocess.run(["rm", "-rf", tmp])
     print("index blocks merged: %d" % merged)
-    if not merged:
+    if merged:
+        invalidate_dir_index(ctx)
+    else:
         print("no tapebackup index blocks on this tape (foreign/mid-span tape)")
 
 
@@ -2093,6 +2120,16 @@ def dir_index_open(ctx):
     c = sqlite3.connect(p, timeout=30)
     c.executescript(DIR_INDEX_SCHEMA)
     return c
+
+
+def invalidate_dir_index(ctx):
+    """Drop the aux directory index; it is rebuilt from the main index."""
+    p = os.path.join(ctx.dir, "dir_index.db")
+    for suf in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.unlink(p + suf)
+        except OSError:
+            pass
 
 
 def ensure_dir_index(ctx, cmain, cd):
@@ -2216,6 +2253,18 @@ def cmd_ls(ctx, args):
         print("%-10s %-19s %-10s %10s %-24s %s" % (
             "host", "backup time", "size", "mtime", "tape", "path"))
         for h in hosts:
+            parent, _, name = path.rpartition("/")
+            row = cd.execute(
+                "SELECT size,mtime,started,tape FROM dir_index"
+                " WHERE host=? AND parent=? AND name=? AND is_dir=0",
+                (h, parent, name)).fetchone()
+            if row:
+                size, mtime, started, tape = row
+                mts = (time.strftime("%Y-%m-%d", time.localtime(mtime))
+                       if mtime else "-")
+                print("%-10s %-19s %-10s %10s %-24s %s" % (
+                    h, started, human(size), mts, tape or "-", path))
+                continue
             _ls_walk(cd, h, path, path)
         cd.close()
         return
@@ -2250,25 +2299,28 @@ _WORKER = {}
 _Q_LATEST = ("SELECT f.size,f.mtime,s.status,st.tape,st.file_no,s.sid"
              " FROM file_index f JOIN sessions s ON s.sid=f.sid"
              " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1"
-             " WHERE f.path=? AND s.host_name=? ORDER BY s.started DESC LIMIT 1")
+             " WHERE f.path=? AND s.host_uuid=?"
+             " ORDER BY s.started DESC, s.sid DESC LIMIT 1")
 
 
-def _worker_init(dbpath, host):
+def _worker_init(dbpath, host_uuid):
     _WORKER["db"] = sqlite3.connect(dbpath, timeout=30)
-    _WORKER["host"] = host
+    _WORKER["host_uuid"] = host_uuid
 
 
 def _remove_check(job):
     """Per-file validation used by remove (runs in the pool or inline)."""
     fp, rel = job
     try:
-        st = os.stat(fp)
+        st = os.lstat(fp)
     except OSError:
         return {"fp": fp, "reason": "stat failed"}
+    if not stat.S_ISREG(st.st_mode):
+        return {"fp": fp, "reason": "not a regular file"}
     db = _WORKER["db"]
-    row = db.execute(_Q_LATEST, (rel, _WORKER["host"])).fetchone()
+    row = db.execute(_Q_LATEST, (rel, _WORKER["host_uuid"])).fetchone()
     if not row:
-        return {"fp": fp, "reason": "not in index"}
+        return {"fp": fp, "reason": "not in index (this host/uuid)"}
     isize, imtime, status, tape, fno, sid = row
     if status != 1:
         return {"fp": fp, "reason": "session not committed"}
@@ -2283,7 +2335,35 @@ def _remove_check(job):
     if not db.execute("SELECT 1 FROM tapes WHERE cid=?", (tape,)).fetchone():
         return {"fp": fp, "reason": "tape %s not in index" % tape}
     return {"fp": fp, "rel": rel, "size": st.st_size, "sid": sid,
-            "tape": tape, "file_no": fno, "reason": None}
+            "tape": tape, "file_no": fno, "reason": None,
+            "dev": st.st_dev, "ino": st.st_ino, "mtime_ns": st.st_mtime_ns}
+
+
+def _safe_unlink(fp, dev, ino, size, mtime_ns):
+    """Unlink fp only if it is still the very same regular file.
+
+    Opens the parent directory (refusing a symlinked parent) and re-checks
+    dev/ino/size/mtime_ns through that dirfd right before unlinking."""
+    parent = os.path.dirname(fp) or "."
+    name = os.path.basename(fp)
+    try:
+        dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != \
+                (dev, ino, size, mtime_ns):
+            return False
+        os.unlink(name, dir_fd=dfd)
+        return True
+    finally:
+        os.close(dfd)
 
 
 def _sha256_file(path, bufsize=1 << 20):
@@ -2321,7 +2401,11 @@ def _load_tape(ctx, tape):
 def _verify_one(job):
     fp, sp, size = job
     try:
-        if not os.path.isfile(sp) or os.path.getsize(sp) != size:
+        st = os.lstat(sp)
+        if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+            return False
+        lt = os.lstat(fp)
+        if not stat.S_ISREG(lt.st_mode) or lt.st_size != size:
             return False
         return _sha256_file(sp) == _sha256_file(fp)
     except OSError:
@@ -2357,15 +2441,19 @@ def _verify_from_tape(ctx, c, cands):
             tmp = tempfile.mkdtemp(prefix="tbver.")
             pos_file(ctx, tapes[0][2])
             paths = sorted({it["rel"] for it in items})
+            members = os.path.join(tmp, "members.list")
+            with open(members, "wb") as f:
+                for pth in paths:
+                    f.write(pth.encode("utf-8", "surrogateescape") + b"\0")
             if len(tapes) == 1:
                 if ctx.rhost:
-                    r1, r2 = ctx.stream_read(tmp, paths)
+                    r1, r2 = ctx.stream_read(tmp, listfile=members)
                     if r2 not in (0, 1):
                         raise RuntimeError("tar extract failed (%d)" % r2)
                 else:
                     base_argv, _ = ctx.tar_argv()
-                    r = run(base_argv + ["-b%d" % BS, "-C", tmp, "-x"] + paths,
-                            check=False)
+                    r = run(base_argv + ["-b%d" % BS, "-C", tmp, "-x",
+                                         "--null", "-T", members], check=False)
                     if r.returncode not in (0, 1):
                         raise RuntimeError("tar extract failed (%d)"
                                            % r.returncode)
@@ -2380,7 +2468,7 @@ def _verify_from_tape(ctx, c, cands):
                 os.rename(labels, os.path.join(tmp, "unused.lbl"))
                 base_argv, _ = ctx.tar_argv()
                 cmd = (base_argv + ["-b%d" % BS, "-M", "-F", sw, "-C", tmp,
-                                    "-x"] + paths)
+                                    "-x", "--null", "-T", members])
                 r = run(cmd, check=False)
                 if r.returncode not in (0, 1):
                     raise RuntimeError("tar extract failed (%d)"
@@ -2389,7 +2477,8 @@ def _verify_from_tape(ctx, c, cands):
                     for it in items]
             for it, ok in zip(items, map_jobs(ctx, _verify_one, jobs,
                                               init=_worker_init,
-                                              initargs=(ctx.dbpath, ctx.host_name))):
+                                              initargs=(ctx.dbpath,
+                                                        ctx.host_uuid))):
                 res[it["fp"]] = ok
         except Exception as e:
             print("VERIFY ERROR (%s) for session %s" % (e, sid[:8]))
@@ -2442,7 +2531,7 @@ def cmd_remove(ctx, args):
             dirs.add(os.path.dirname(ap))
     cands = []
     for r in map_jobs(ctx, _remove_check, work, init=_worker_init,
-                      initargs=(ctx.dbpath, host)):
+                      initargs=(ctx.dbpath, ctx.host_uuid)):
         if r.get("reason"):
             print("SKIP (%s): %s" % (r["reason"], r["fp"]))
             skipped.append((r["fp"], r["reason"]))
@@ -2452,6 +2541,7 @@ def cmd_remove(ctx, args):
     if verify and cands:
         ver = _verify_from_tape(ctx, c, cands)
     c.close()
+    do_delete = yes and not ctx.dry
     ok = 0
     okbytes = 0
     for it in cands:
@@ -2460,19 +2550,18 @@ def cmd_remove(ctx, args):
             print("VERIFY FAILED (tape copy differs or unavailable): %s" % fp)
             skipped.append((fp, "tape verify failed"))
             continue
-        if yes:
-            try:
-                os.unlink(fp)
-            except OSError as e:
-                print("ERROR (%s): %s" % (e, fp))
-                skipped.append((fp, "unlink failed: %s" % e))
+        if do_delete:
+            if not _safe_unlink(fp, it["dev"], it["ino"], it["size"],
+                                it["mtime_ns"]):
+                print("ERROR (file changed or unsafe to delete): %s" % fp)
+                skipped.append((fp, "changed/unsafe before delete"))
                 continue
             print("DELETED %s  [%s]" % (fp, it["tape"]))
         else:
             print("WOULD DELETE %s  [%s]" % (fp, it["tape"]))
         ok += 1
         okbytes += it["size"]
-    if prune and yes:
+    if prune and do_delete:
         for d in sorted(dirs, key=len, reverse=True):
             if d in roots:
                 continue
@@ -2483,8 +2572,8 @@ def cmd_remove(ctx, args):
                 pass
     print("---")
     print("%s %d file(s), %s%s" % (
-        "removed" if yes else "would remove", ok, human(okbytes),
-        "" if yes else "  (dry run; add --yes to delete)"))
+        "removed" if do_delete else "would remove", ok, human(okbytes),
+        "" if do_delete else "  (dry run; add --yes to delete)"))
     if skipped:
         print("")
         print("=" * 78)
@@ -2498,7 +2587,7 @@ def cmd_tapes(ctx, args):
     c = db_open(ctx)
     rows = c.execute(
         "SELECT t.cid,t.barcode,count(DISTINCT st.sid),count(DISTINCT st.tape),"
-        " coalesce(sum(DISTINCT s.est_size),0)"
+        " coalesce(sum(s.est_size),0)"
         " FROM tapes t LEFT JOIN session_tapes st ON st.tape=t.cid"
         " LEFT JOIN sessions s ON s.sid=st.sid GROUP BY t.cid ORDER BY t.created").fetchall()
     c.close()
@@ -2617,6 +2706,16 @@ Global flag:
 """)
 
 
+def _parse_jobs(val):
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        die("bad value for -j/--jobs: %r (want a positive integer)" % (val,))
+    if n < 1:
+        die("-j/--jobs must be >= 1")
+    return n
+
+
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "_mam":
@@ -2634,17 +2733,22 @@ def main():
     dry = False
     jobs = None
     while argv:
+        if argv[0] == "--":
+            argv = argv[1:]
+            break
         if argv[0] in ("-n", "--dry-run"):
             dry = True
             argv = argv[1:]
-        elif argv[0] in ("-j", "--jobs") and len(argv) > 1:
-            jobs = int(argv[1])
+        elif argv[0] in ("-j", "--jobs"):
+            if len(argv) < 2:
+                die("%s needs a value" % argv[0])
+            jobs = _parse_jobs(argv[1])
             argv = argv[2:]
         elif argv[0].startswith("--jobs="):
-            jobs = int(argv[0].split("=", 1)[1])
+            jobs = _parse_jobs(argv[0].split("=", 1)[1])
             argv = argv[1:]
-        elif argv[0].startswith("-j") and argv[0][2:].isdigit():
-            jobs = int(argv[0][2:])
+        elif argv[0].startswith("-j") and argv[0][2:]:
+            jobs = _parse_jobs(argv[0][2:])
             argv = argv[1:]
         else:
             break
@@ -2657,19 +2761,19 @@ def main():
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--":
+            rest.extend(args[i + 1:])
+            break
         if a in ("-j", "--jobs") and i + 1 < len(args):
-            try:
-                jobs = int(args[i + 1])
-            except ValueError:
-                die("bad value for %s: %s" % (a, args[i + 1]))
+            jobs = _parse_jobs(args[i + 1])
             i += 2
             continue
         if a.startswith("--jobs="):
-            jobs = int(a.split("=", 1)[1])
+            jobs = _parse_jobs(a.split("=", 1)[1])
             i += 1
             continue
-        if a.startswith("-j") and a[2:].isdigit():
-            jobs = int(a[2:])
+        if a.startswith("-j") and a[2:]:
+            jobs = _parse_jobs(a[2:])
             i += 1
             continue
         rest.append(a)
