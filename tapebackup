@@ -314,11 +314,7 @@ class Ctx:
         self.rmt = os.environ.get("TAPEBACKUP_RMT", "/usr/sbin/rmt")
         self.dry = dry
         self.rate = 0
-        try:
-            self.jobs = max(1, int(os.environ.get("TAPEBACKUP_JOBS", "1") or 1))
-        except ValueError:
-            die("bad TAPEBACKUP_JOBS: %r"
-                % os.environ.get("TAPEBACKUP_JOBS"))
+        self.jobs = _parse_jobs(os.environ.get("TAPEBACKUP_JOBS", "1") or "1")
         self.host_uuid = self._machine_id()
         self.host_name = self._host_name()
         self._locks = []
@@ -488,6 +484,16 @@ class Ctx:
         if rcv not in (0, None):
             rc1 = rc1 or rcv
         return rc1, rc2
+
+    def stream_file(self, path):
+        """Send a local file to the remote tape device with dd."""
+        if self.dry:
+            print("[dry-run] would stream %s to %s" % (path, self.rdev))
+            return 0
+        dd = "sudo dd of=%s bs=1M iflag=fullblock 2>/dev/null" % shlex.quote(self.rdev)
+        with open(path, "rb") as f:
+            p2 = subprocess.Popen(self.ssh_argv_stream() + [dd], stdin=f)
+            return p2.wait()
 
     def stream_read(self, dest, paths=(), listfile=None):
         """ssh dd -> tar -x. Returns (ssh_rc, tar_rc).
@@ -915,66 +921,103 @@ def block_dump(ctx, outdir, cid, barcode, fileno, prev, force_status_sid=None):
 
 
 def block_merge(ctx, bdir, tape_cid_hint=None):
-    """Merge one TAPEIDX.<n> directory into the DB (latest wins)."""
+    """Merge one TAPEIDX.<n> directory into the DB (latest wins).
+
+    The block is parsed and validated in full before anything is committed:
+    required files must exist, rows must be well formed, checksums must look
+    like sha256 and every session must have its file rows.  Only validated
+    sessions (and their session_tapes/file_index rows) are imported, and their
+    previous rows are replaced atomically."""
     c = db_open(ctx)
     try:
-        if not os.path.exists(os.path.join(bdir, "sessions.tsv")) or \
-                not os.path.exists(os.path.join(bdir, "file_index.tsv")):
-            print("WARNING: incomplete index block %s (missing ts files); "
-                  "skipping" % bdir)
+        need = ("sessions.tsv", "session_tapes.tsv", "file_index.tsv")
+        missing = [n for n in need if not os.path.exists(os.path.join(bdir, n))]
+        if missing:
+            print("WARNING: incomplete index block %s (missing %s); skipping"
+                  % (bdir, ", ".join(missing)))
             return
+        sum_re = re.compile(r"[0-9a-f]{64}$")
+        sessions = []
+        for line in open(os.path.join(bdir, "sessions.tsv")):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9:
+                print("WARNING: short session row in %s; skipped" % bdir)
+                continue
+            if len(parts) >= 11:
+                sid, hu, hn, st, fin, status, paths, esz, efc, rid, cseq = parts[:11]
+            else:
+                sid, hu, hn, st, fin, status, paths, esz, efc = parts[:9]
+                rid, cseq = "", ""
+            try:
+                esz, efc, status = int(esz or 0), int(efc or 0), int(status or 0)
+                cseq_i = int(cseq) if cseq else None
+            except ValueError:
+                print("WARNING: bad numbers in session row %s; skipped" % sid[:8])
+                continue
+            sessions.append((sid, hu, hn, st, fin, unesc(paths), esz, efc,
+                             status, rid or None, cseq_i))
+        files = []
         counts = {}
-        fp_tsv = os.path.join(bdir, "file_index.tsv")
-        if os.path.exists(fp_tsv):
-            for line in open(fp_tsv):
-                if line.strip():
-                    k = line.split("\t", 1)[0]
-                    counts[k] = counts.get(k, 0) + 1
-        p = os.path.join(bdir, "sessions.tsv")
-        if os.path.exists(p):
-            for line in open(p):
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 11:
-                    sid, hu, hn, st, fin, status, paths, esz, efc, rid, cseq = parts[:11]
-                else:
-                    sid, hu, hn, st, fin, status, paths, esz, efc = parts[:9]
-                    rid, cseq = "", ""
-                if int(efc or 0) > 0 and counts.get(sid, 0) == 0:
-                    print("WARNING: session %s has %s files in metadata but "
-                          "no rows in file_index.tsv; skipping"
-                          % (sid[:8], efc))
-                    continue
-                c.execute("INSERT OR REPLACE INTO sessions"
-                          "(sid,host_uuid,host_name,started,finished,paths,est_size,"
-                          "est_files,status,run_id,chunk_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                          (sid, hu, hn, st, fin, unesc(paths),
-                           int(esz or 0), int(efc or 0), int(status or 0),
-                           rid or None, int(cseq) if cseq else None))
-        p = os.path.join(bdir, "session_tapes.tsv")
-        if os.path.exists(p):
-            for line in open(p):
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                sid, seq, tape, fno = line.split("\t")
-                c.execute("INSERT OR REPLACE INTO session_tapes VALUES(?,?,?,?)",
-                          (sid, int(seq), unesc(tape), int(fno)))
-        p = os.path.join(bdir, "file_index.tsv")
-        if os.path.exists(p):
-            for line in open(p):
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                parts = line.split("\t")
-                sid, path, size = parts[0], parts[1], parts[2]
-                mt = int(parts[3]) if len(parts) > 3 and parts[3] else None
-                sm = parts[4] if len(parts) > 4 and parts[4] else None
-                c.execute("INSERT OR REPLACE INTO file_index"
-                          "(sid,path,size,mtime,sum) VALUES(?,?,?,?,?)",
-                          (sid, unesc(path), int(size), mt, sm))
+        for line in open(os.path.join(bdir, "file_index.tsv")):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                print("WARNING: short file row in %s; skipped" % bdir)
+                continue
+            sid, path, size = parts[0], parts[1], parts[2]
+            try:
+                size = int(size)
+                mt = int(parts[3]) if parts[3] else None
+            except ValueError:
+                print("WARNING: bad numbers in file row for %s; skipped" % sid[:8])
+                continue
+            sm = parts[4] if len(parts) > 4 and parts[4] else None
+            if sm and not sum_re.match(sm):
+                sm = None
+            files.append((sid, unesc(path), size, mt, sm))
+            counts[sid] = counts.get(sid, 0) + 1
+        keep = set()
+        for s in sessions:
+            sid, _hu, _hn, _st, _fin, _p, _esz, efc = s[:8]
+            if efc > 0 and counts.get(sid, 0) == 0:
+                print("WARNING: session %s has %d files in metadata but no "
+                      "rows in file_index.tsv; skipping" % (sid[:8], efc))
+                continue
+            keep.add(sid)
+        tape_rows = []
+        for line in open(os.path.join(bdir, "session_tapes.tsv")):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                print("WARNING: short session_tapes row in %s; skipped" % bdir)
+                continue
+            sid, seq, tape, fno = parts[:4]
+            if sid not in keep:
+                continue
+            try:
+                tape_rows.append((sid, int(seq), unesc(tape), int(fno)))
+            except ValueError:
+                print("WARNING: bad session_tapes row for %s; skipped" % sid[:8])
+        for sid in keep:
+            c.execute("DELETE FROM file_index WHERE sid=?", (sid,))
+            c.execute("DELETE FROM session_tapes WHERE sid=?", (sid,))
+        c.executemany("INSERT OR REPLACE INTO sessions"
+                      "(sid,host_uuid,host_name,started,finished,paths,est_size,"
+                      "est_files,status,run_id,chunk_seq)"
+                      " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      [s for s in sessions if s[0] in keep])
+        c.executemany("INSERT OR REPLACE INTO session_tapes VALUES(?,?,?,?)",
+                      tape_rows)
+        c.executemany("INSERT OR REPLACE INTO file_index"
+                      "(sid,path,size,mtime,sum) VALUES(?,?,?,?,?)",
+                      [f for f in files if f[0] in keep])
         p = os.path.join(bdir, "runs.tsv")
         if os.path.exists(p):
             for line in open(p):
@@ -984,7 +1027,8 @@ def block_merge(ctx, bdir, tape_cid_hint=None):
                 parts = [unesc(x) for x in (line.split("\t") + [""] * 7)[:7]]
                 c.execute("INSERT OR REPLACE INTO runs VALUES(?,?,?,?,?,?,?)",
                           (parts[0], parts[1], parts[2] or None, parts[3],
-                           int(parts[4] or 0), int(parts[5] or 0), int(parts[6] or 0)))
+                           int(parts[4] or 0), int(parts[5] or 0),
+                           int(parts[6] or 0)))
         p = os.path.join(bdir, "tapes.tsv")
         if os.path.exists(p):
             for line in open(p):
@@ -993,7 +1037,8 @@ def block_merge(ctx, bdir, tape_cid_hint=None):
                     continue
                 cid, bc, created, by = (line.split("\t") + [""] * 4)[:4]
                 c.execute("INSERT OR IGNORE INTO tapes(cid,barcode,created,created_by)"
-                          " VALUES(?,?,?,?)", (unesc(cid), unesc(bc), unesc(created), unesc(by)))
+                          " VALUES(?,?,?,?)",
+                          (unesc(cid), unesc(bc), unesc(created), unesc(by)))
         c.commit()
     finally:
         c.close()
@@ -1260,6 +1305,29 @@ def walk_tree(ctx, roots):
     return files, dirs
 
 
+def _parse_chunk_tar(path):
+    """Stream a tar file and return {member: (size, mtime, sha256)}.
+
+    Hashes come from the exact archive bytes that are sent to tape, so the
+    index records what was archived, not a separate pre-read of the source."""
+    meta = {}
+    with tarfile.open(path, mode="r|") as tf:
+        for m in tf:
+            if not m.isfile():
+                continue
+            h = hashlib.sha256()
+            f = tf.extractfile(m)
+            if f is None:
+                continue
+            while True:
+                b = f.read(1 << 20)
+                if not b:
+                    break
+                h.update(b)
+            meta[m.name] = (m.size, int(m.mtime), h.hexdigest())
+    return meta
+
+
 def build_manifest(ctx, sources):
     files = []
     dir_sources = []
@@ -1278,7 +1346,14 @@ def build_manifest(ctx, sources):
         more, _dirs = walk_tree(ctx, dir_sources)
         files.extend(more)
     files.sort()
-    return files
+    seen = set()
+    uniq = []
+    for fp, sz, mt in files:
+        if fp in seen:
+            continue
+        seen.add(fp)
+        uniq.append((fp, sz, mt))
+    return uniq
 
 
 def split_chunks(files, chunk_bytes):
@@ -1353,9 +1428,11 @@ def tape_state_full(ctx, mam):
 
 
 def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
-    """Write one chunk: tar file + its own index block, commit DB, release lock."""
+    """Write one chunk: local tar+hashes -> stream that tar -> index block."""
     ctx.lock()
-    tmp = tempfile.mkdtemp(prefix="tbchunk.")
+    tdir = os.path.join(ctx.dir, "tmp")
+    os.makedirs(tdir, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="tbchunk.", dir=tdir)
     try:
         ctx.ensure_ready()
         mam = tape_id(ctx)
@@ -1382,29 +1459,54 @@ def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
             if state not in ("blank",):
                 if not force:
                     die("new tape is not blank (%s); rerun with --force to overwrite it" % state)
+
+        # 1) build the tar locally and hash the archive bytes themselves
+        listf = os.path.join(tmp, "chunk.list")
+        with open(listf, "wb") as f:
+            for fp, _, _ in chunk_files:
+                f.write(fp.encode("utf-8", "surrogateescape") + b"\0")
+        tarpath = os.path.join(tmp, "chunk.tar")
+        r = run(["tar", "-c", "-b%d" % BS, "--null", "-T", listf,
+                 "-f", tarpath], check=False)
+        if r.returncode != 0:
+            die("tar returned %d (files changed while reading?); "
+                "chunk not committed" % r.returncode)
+        arch = _parse_chunk_tar(tarpath)
+        meta = {}
+        for fp, _sz, _mt in chunk_files:
+            name = fp.lstrip("/")
+            m = arch.get(name)
+            if m is None:
+                die("archive is missing %s; chunk not committed" % name)
+            meta[fp] = m
+
+        # 2) position on tape
         if state == "tapebackup":
             c0 = db_open(ctx)
-            pend = [r[0] for r in c0.execute(
-                "SELECT DISTINCT s.sid FROM sessions s"
+            pend = [(sid, fno) for sid, fno in c0.execute(
+                "SELECT DISTINCT s.sid, st.file_no FROM sessions s"
                 " JOIN session_tapes st ON st.sid=s.sid"
-                " WHERE s.status=0 AND st.tape=?", (cid,))]
+                " WHERE s.status=0 AND st.tape=? AND s.run_id=?",
+                (cid, run_id))]
+            for psid, _fno in pend:
+                c0.execute("DELETE FROM file_index WHERE sid=?", (psid,))
+                c0.execute("DELETE FROM session_tapes WHERE sid=?", (psid,))
+                c0.execute("DELETE FROM sessions WHERE sid=?", (psid,))
             if pend:
-                for psid in pend:
-                    c0.execute("DELETE FROM file_index WHERE sid=?", (psid,))
-                    c0.execute("DELETE FROM session_tapes WHERE sid=?", (psid,))
-                    c0.execute("DELETE FROM sessions WHERE sid=?", (psid,))
                 c0.commit()
-                print("discarded %d pending (uncommitted) session(s) on %s"
+                print("discarded %d pending session(s) of this run on %s"
                       % (len(pend), cid), flush=True)
-            row = c0.execute("SELECT max(file_no) FROM session_tapes WHERE tape=?",
-                             (cid,)).fetchone()
+            row = c0.execute(
+                "SELECT max(st.file_no) FROM session_tapes st"
+                " JOIN sessions s ON s.sid=st.sid"
+                " WHERE st.tape=? AND s.status=1", (cid,)).fetchone()
             c0.close()
             next_file = (row[0] + 2) if (row and row[0]) else 2
             prev_block = (next_file - 1) if next_file > 2 else None
+            skip_probe = any(fno == next_file for _sid, fno in pend)
             pos_file(ctx, next_file)
             positioned = False
-            if read_cur(ctx):
-                # unindexed data sits in the slot we wanted to use (partial chunk)
+            if not skip_probe and read_cur(ctx):
                 warn("found unindexed data at file %d; locating tape end ..." % next_file)
                 probe = eom_probe(ctx)
                 if probe is None:
@@ -1412,18 +1514,17 @@ def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
                 nf_eod, last_fn, partial = probe
                 tail_index = last_fn + 1 if partial else last_fn
                 if tail_index == next_file:
-                    # the unindexed partial chunk is the last file: truncate & reuse
                     print("reclaiming partial chunk at file %d (quick erase) ..."
                           % next_file, flush=True)
                     pos_file(ctx, next_file)
                     ctx.sg_erase(long=False)
-                    positioned = True   # already at the reclaimed position
+                    positioned = True
                 else:
                     warn("valid data exists after the partial chunk; appending at file %d"
                          % nf_eod)
                     next_file = nf_eod
                     prev_block = None
-                    positioned = True   # eom left us at end of data
+                    positioned = True
         elif state == "blank" or force:
             ctx.mt("rewind")
             write_header(ctx, tmp, cid, barcode)
@@ -1432,31 +1533,22 @@ def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
         else:
             die("tape contains %s data; use --force to overwrite" % state)
 
-        meta = {}
-        for item in map_jobs(ctx, _hash_path, [fp for fp, _, _ in chunk_files]):
-            if item is None:
-                die("cannot hash a source file of this chunk")
-            meta[item[0]] = (item[1], item[2], item[3])
-        listf = os.path.join(tmp, "chunk.list")
-        with open(listf, "wb") as f:
-            for fp, _, _ in chunk_files:
-                f.write(fp.encode("utf-8", "surrogateescape") + b"\0")
+        # 3) stream the exact tar that was hashed
         if not locals().get("positioned"):
             pos_file(ctx, next_file)
         positioned = False
         t0 = time.time()
         if ctx.rhost:
-            r1, r2 = ctx.stream_write(listfile=listf)
+            r2 = ctx.stream_file(tarpath)
             if r2 != 0:
                 die("remote dd failed (%d)" % r2)
-            if r1 != 0:
-                die("tar returned %d (files changed while reading?); "
-                    "chunk not committed" % r1)
         else:
-            r = ctx.tar(["-c", "--null", "-T", listf], check=False)
-            if r.returncode != 0:
-                die("tar returned %d (files changed while reading?); "
-                    "chunk not committed" % r.returncode)
+            with open(tarpath, "rb") as f:
+                p2 = subprocess.Popen(["dd", "of=%s" % ctx.dev,
+                                       "bs=1M", "iflag=fullblock"],
+                                      stdin=f)
+                if p2.wait() != 0:
+                    die("dd failed")
         dt = time.time() - t0
         size = need
         print("[chunk %d/%d] %s in %d files -> tape %s file %d (%.0fs, %s/s)"
@@ -1496,8 +1588,6 @@ def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
                 else:
                     ctx.tar(["-c", "-C", tmp, name])
         except SystemExit:
-            # keep the rows: the data is on tape and the local index still
-            # knows where it is.  status stays 0 so remove will refuse it.
             print("WARNING: index block write failed; session %s kept with "
                   "status=0 (remove will not delete these files)" % sid[:8],
                   flush=True)
@@ -1535,7 +1625,7 @@ def cmd_write(ctx, args):
         i = args.index("--label")
         label_override = args[i + 1]
         del args[i:i + 2]
-    if not args:
+    if not args and not literals:
         die("usage: write [--force] [--chunk-size 50G] SRC...")
     files = build_manifest(ctx, args + literals)
     if not files:
@@ -1581,16 +1671,17 @@ def cmd_write(ctx, args):
 def cmd_resume(ctx, args):
     opts, literals = _split_literal(args)
     force = "--force" in opts
-    args = [a for a in opts if a not in ("--force",)] + literals
+    opts = [a for a in opts if a not in ("--force",)]
     cooldown = 0
-    if "--cooldown" in args:
-        i = args.index("--cooldown")
-        cooldown = int(args[i + 1])
-        del args[i:i + 2]
-    if "--rate" in args:
-        i = args.index("--rate")
-        ctx.rate = int(float(args[i + 1]) * 1024 * 1024)
-        del args[i:i + 2]
+    if "--cooldown" in opts:
+        i = opts.index("--cooldown")
+        cooldown = int(opts[i + 1])
+        del opts[i:i + 2]
+    if "--rate" in opts:
+        i = opts.index("--rate")
+        ctx.rate = int(float(opts[i + 1]) * 1024 * 1024)
+        del opts[i:i + 2]
+    args = opts + literals
     if not args:
         die("usage: resume RUN_ID [--force] [--rate MBps] [--cooldown SEC]")
     rid = args[0]
@@ -1837,7 +1928,7 @@ def cmd_extract(ctx, args):
             if r2 not in (0, 1):
                 die("tar extract failed (%d)" % r2)
         elif len(tapes) == 1:
-            cmd = base_argv + ["-b%d" % BS, "-C", dest, "-x"] + paths
+            cmd = base_argv + ["-b%d" % BS, "-C", dest, "-x", "--"] + paths
             r = run(cmd, check=False)
             if r.returncode not in (0, 1):
                 die("tar extract failed (%d)" % r.returncode)
@@ -1850,7 +1941,8 @@ def cmd_extract(ctx, args):
             sw = os.path.join(tmp, "switch.sh")
             gen_switch_script(ctx, sw, os.path.join(tmp, "unused"), "read")
             os.rename(lbl, os.path.join(tmp, "unused.lbl"))
-            cmd = base_argv + ["-b%d" % BS, "-M", "-F", sw, "-C", dest, "-x"] + paths
+            cmd = base_argv + ["-b%d" % BS, "-M", "-F", sw, "-C", dest,
+                               "-x", "--"] + paths
             r = run(cmd, check=False)
             subprocess.run(["rm", "-rf", tmp])
             if r.returncode not in (0, 1):
@@ -2072,10 +2164,10 @@ def _scan(ctx, args):
             merged += 1
     finally:
         subprocess.run(["rm", "-rf", tmp])
+        if merged:
+            invalidate_dir_index(ctx)
     print("index blocks merged: %d" % merged)
-    if merged:
-        invalidate_dir_index(ctx)
-    else:
+    if not merged:
         print("no tapebackup index blocks on this tape (foreign/mid-span tape)")
 
 
@@ -2203,7 +2295,8 @@ def ensure_dir_index(ctx, cmain, cd):
     the delta when a newer session changes (or re-adds) a file."""
     built = {r[0] for r in cd.execute("SELECT sid FROM dir_built")}
     todo = [r for r in cmain.execute(
-                "SELECT sid,host_name,started FROM sessions ORDER BY started, sid")
+                "SELECT sid,host_name,started FROM sessions WHERE status=1"
+                " ORDER BY started, sid")
             if r[0] not in built]
     cd.execute("CREATE TEMP TABLE IF NOT EXISTS _nf("
                "parent TEXT, name TEXT, size INTEGER, mtime INTEGER)")
@@ -2403,12 +2496,16 @@ def _remove_check(job):
         h = _hash_path(fp)
         if not h or h[3] != isum:
             return {"fp": fp, "reason": "content changed (checksum mismatch)"}
+        if (h[4], h[5], h[6], h[7]) != (st.st_dev, st.st_ino,
+                                        st.st_mtime_ns, st.st_ctime_ns):
+            return {"fp": fp, "reason": "file changed while hashing"}
     return {"fp": fp, "rel": rel, "size": st.st_size, "sid": sid,
             "tape": tape, "file_no": fno, "reason": None,
-            "dev": st.st_dev, "ino": st.st_ino, "mtime_ns": st.st_mtime_ns}
+            "dev": st.st_dev, "ino": st.st_ino, "mtime_ns": st.st_mtime_ns,
+            "ctime_ns": st.st_ctime_ns}
 
 
-def _safe_unlink(fp, dev, ino, size, mtime_ns):
+def _safe_unlink(fp, dev, ino, size, mtime_ns, ctime_ns):
     """Unlink fp only if it is still the very same regular file.
 
     Opens the parent directory (refusing a symlinked parent) and re-checks
@@ -2426,8 +2523,8 @@ def _safe_unlink(fp, dev, ino, size, mtime_ns):
             return False
         if not stat.S_ISREG(st.st_mode):
             return False
-        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != \
-                (dev, ino, size, mtime_ns):
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+                st.st_ctime_ns) != (dev, ino, size, mtime_ns, ctime_ns):
             return False
         try:
             os.unlink(name, dir_fd=dfd)
@@ -2439,22 +2536,33 @@ def _safe_unlink(fp, dev, ino, size, mtime_ns):
 
 
 def _hash_path(fp):
-    """sha256 of one regular file (no symlink following); None on error."""
+    """sha256 of one regular file (no symlink following); None on error.
+
+    Returns (path, size, mtime, sha256, dev, ino, mtime_ns, ctime_ns) only if
+    the fstat-identity is stable across the whole read."""
     try:
-        st = os.lstat(fp)
-        if not stat.S_ISREG(st.st_mode):
-            return None
         fd = os.open(fp, os.O_RDONLY | os.O_NOFOLLOW)
         try:
+            st0 = os.fstat(fd)
+            if not stat.S_ISREG(st0.st_mode):
+                return None
             h = hashlib.sha256()
             while True:
                 b = os.read(fd, 1 << 20)
                 if not b:
                     break
                 h.update(b)
+            st1 = os.fstat(fd)
         finally:
             os.close(fd)
-        return (fp, st.st_size, int(st.st_mtime), h.hexdigest())
+        ident0 = (st0.st_dev, st0.st_ino, st0.st_size, st0.st_mtime_ns,
+                  st0.st_ctime_ns)
+        ident1 = (st1.st_dev, st1.st_ino, st1.st_size, st1.st_mtime_ns,
+                  st1.st_ctime_ns)
+        if ident0 != ident1:
+            return None
+        return (fp, st1.st_size, int(st1.st_mtime), h.hexdigest(),
+                st1.st_dev, st1.st_ino, st1.st_mtime_ns, st1.st_ctime_ns)
     except OSError:
         return None
 
@@ -2655,7 +2763,7 @@ def cmd_remove(ctx, args):
             continue
         if do_delete:
             if not _safe_unlink(fp, it["dev"], it["ino"], it["size"],
-                                it["mtime_ns"]):
+                                it["mtime_ns"], it["ctime_ns"]):
                 print("ERROR (file changed or unsafe to delete): %s" % fp)
                 skipped.append((fp, "changed/unsafe before delete"))
                 continue
@@ -2872,7 +2980,7 @@ def main():
     cmd, args = argv[0], argv[1:]
     for a in args[:args.index("--") if "--" in args else len(args)]:
         if a in ("-j", "--jobs") or a.startswith("--jobs=") or \
-                (a.startswith("-j") and a[2:]):
+                (a.startswith("-j") and a[2:].isdigit()):
             die("-j/--jobs is a global flag: put it before '%s'" % cmd)
     ctx = Ctx(dry=dry)
     if jobs is not None:
