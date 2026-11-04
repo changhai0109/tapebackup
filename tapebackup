@@ -1078,29 +1078,32 @@ _POOL = None
 _POOL_N = None
 
 
-def _pool_get(n):
+def _pool_get(n, init=None, initargs=()):
     global _POOL, _POOL_N
     if _POOL is None or _POOL_N != n:
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
         # fork keeps __main__ (this single-file tool) available in workers
         mpctx = multiprocessing.get_context("fork")
-        _POOL = ProcessPoolExecutor(max_workers=n, mp_context=mpctx)
+        _POOL = ProcessPoolExecutor(max_workers=n, mp_context=mpctx,
+                                    initializer=init, initargs=initargs)
         _POOL_N = n
     return _POOL
 
 
-def map_jobs(ctx, fn, items):
+def map_jobs(ctx, fn, items, init=None, initargs=()):
     """Run fn(item) over items, using ctx.jobs worker processes when > 1.
 
     The pool is created lazily and reused for the whole process lifetime, so
     commands can share it.  With jobs == 1 (the default) this is a plain
-    serial loop."""
+    serial loop; init() is then called once in the current process."""
     items = list(items)
     n = getattr(ctx, "jobs", 1) or 1
     if n <= 1 or len(items) < 2:
+        if init:
+            init(*initargs)
         return [fn(x) for x in items]
-    return list(_pool_get(n).map(fn, items))
+    return list(_pool_get(n, init, initargs).map(fn, items))
 
 
 def build_manifest(sources):
@@ -2138,6 +2141,46 @@ def cmd_ls(ctx, args):
     cd.close()
 
 
+_WORKER = {}
+_Q_LATEST = ("SELECT f.size,f.mtime,s.status,st.tape,st.file_no,s.sid"
+             " FROM file_index f JOIN sessions s ON s.sid=f.sid"
+             " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1"
+             " WHERE f.path=? AND s.host_name=? ORDER BY s.started DESC LIMIT 1")
+
+
+def _worker_init(dbpath, host):
+    _WORKER["db"] = sqlite3.connect(dbpath, timeout=30)
+    _WORKER["host"] = host
+
+
+def _remove_check(job):
+    """Per-file validation used by remove (runs in the pool or inline)."""
+    fp, rel = job
+    try:
+        st = os.stat(fp)
+    except OSError:
+        return {"fp": fp, "reason": "stat failed"}
+    db = _WORKER["db"]
+    row = db.execute(_Q_LATEST, (rel, _WORKER["host"])).fetchone()
+    if not row:
+        return {"fp": fp, "reason": "not in index"}
+    isize, imtime, status, tape, fno, sid = row
+    if status != 1:
+        return {"fp": fp, "reason": "session not committed"}
+    if isize != st.st_size:
+        return {"fp": fp, "reason": "size changed: index %s, disk %s"
+                % (human(isize or 0), human(st.st_size))}
+    if imtime is None or int(imtime) != int(st.st_mtime):
+        return {"fp": fp, "reason": "mtime changed: index %s, disk %s"
+                % (imtime, int(st.st_mtime))}
+    if not tape:
+        return {"fp": fp, "reason": "no tape recorded"}
+    if not db.execute("SELECT 1 FROM tapes WHERE cid=?", (tape,)).fetchone():
+        return {"fp": fp, "reason": "tape %s not in index" % tape}
+    return {"fp": fp, "rel": rel, "size": st.st_size, "sid": sid,
+            "tape": tape, "file_no": fno, "reason": None}
+
+
 def _sha256_file(path, bufsize=1 << 20):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -2262,7 +2305,7 @@ def cmd_remove(ctx, args):
     read back from tape and its content compared (sha256) before deleting;
     the user is asked to insert the right tape (and again for every further
     tape if a session spans volumes).  Dry-run unless --yes is given.
-    """
+    Per-file checks and hashes run in -j worker processes."""
     yes = "--yes" in args or "-y" in args
     prune = "--prune-dirs" in args
     verify = "--verify-tape" in args
@@ -2272,11 +2315,7 @@ def cmd_remove(ctx, args):
         die("usage: remove [--yes] [--prune-dirs] [--verify-tape] PATH...")
     host = ctx.host_name
     c = db_open(ctx)
-    q = ("SELECT f.size,f.mtime,s.status,st.tape,st.file_no,s.sid"
-         " FROM file_index f JOIN sessions s ON s.sid=f.sid"
-         " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1"
-         " WHERE f.path=? AND s.host_name=? ORDER BY s.started DESC LIMIT 1")
-    cands = []
+    work = []
     skipped = []
     dirs = set()
     for target in args:
@@ -2286,52 +2325,24 @@ def cmd_remove(ctx, args):
             skipped.append((target, "missing or symlink"))
             continue
         if os.path.isdir(ap):
-            files = []
             for root, _dns, fns in os.walk(ap):
                 dirs.add(root)
                 for fn in fns:
                     fp = os.path.join(root, fn)
                     if os.path.islink(fp) or not os.path.isfile(fp):
                         continue
-                    files.append(fp)
+                    work.append((fp, fp.lstrip("/")))
         else:
-            files = [ap]
+            work.append((ap, ap.lstrip("/")))
             dirs.add(os.path.dirname(ap))
-        for fp in files:
-            rel = fp.lstrip("/")
-            try:
-                st = os.stat(fp)
-            except OSError as e:
-                print("SKIP (stat failed: %s): %s" % (e, fp))
-                skipped.append((fp, "stat failed"))
-                continue
-            row = c.execute(q, (rel, host)).fetchone()
-            if not row:
-                print("SKIP (not in index): %s" % fp)
-                skipped.append((fp, "not in index"))
-                continue
-            isize, imtime, status, tape, fno, sid = row
-            if status != 1:
-                print("SKIP (session not committed): %s" % fp)
-                skipped.append((fp, "session not committed"))
-                continue
-            if isize != st.st_size:
-                print("SKIP (size changed: index %s, disk %s): %s"
-                      % (human(isize or 0), human(st.st_size), fp))
-                skipped.append((fp, "size changed"))
-                continue
-            if imtime is None or int(imtime) != int(st.st_mtime):
-                print("SKIP (mtime changed: index %s, disk %s): %s"
-                      % (imtime, int(st.st_mtime), fp))
-                skipped.append((fp, "mtime changed"))
-                continue
-            if not tape or not c.execute(
-                    "SELECT 1 FROM tapes WHERE cid=?", (tape,)).fetchone():
-                print("SKIP (tape %s not in index): %s" % (tape or "-", fp))
-                skipped.append((fp, "tape %s not in index" % (tape or "-")))
-                continue
-            cands.append({"fp": fp, "rel": rel, "sid": sid, "tape": tape,
-                          "file_no": fno, "size": st.st_size})
+    cands = []
+    for r in map_jobs(ctx, _remove_check, work, init=_worker_init,
+                      initargs=(ctx.dbpath, host)):
+        if r.get("reason"):
+            print("SKIP (%s): %s" % (r["reason"], r["fp"]))
+            skipped.append((r["fp"], r["reason"]))
+        else:
+            cands.append(r)
     ver = {}
     if verify and cands:
         ver = _verify_from_tape(ctx, c, cands)
