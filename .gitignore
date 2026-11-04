@@ -1,6 +1,7 @@
 # index database (large binary, stays on this host)
 index.db
 index.db-*
+runs
 runs/
 
 # logs and scratch
@@ -9,4 +10,7 @@ temp.log
 __pycache__/
 *.pyc
 dir_index.db
+dir_index.db-*
+tmp
+tmp/
 dir_index.db-*
