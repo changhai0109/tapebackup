@@ -2084,6 +2084,107 @@ def cmd_ls(ctx, args):
     cd.close()
 
 
+def cmd_remove(ctx, args):
+    """remove [--yes] [--prune-dirs] PATH...
+
+    Delete local files only when the index proves they are already on tape
+    unchanged: the path must be indexed, its session committed, its size and
+    mtime identical to the indexed copy, and the tape that holds it must still
+    be present in the index (i.e. not erased).  Dry-run unless --yes is given.
+    """
+    yes = "--yes" in args or "-y" in args
+    prune = "--prune-dirs" in args
+    args = [a for a in args if a not in ("--yes", "-y", "--prune-dirs")]
+    if not args:
+        die("usage: remove [--yes] [--prune-dirs] PATH...")
+    host = ctx.host_name
+    c = db_open(ctx)
+    q = ("SELECT f.size,f.mtime,s.status,st.tape"
+         " FROM file_index f JOIN sessions s ON s.sid=f.sid"
+         " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1"
+         " WHERE f.path=? AND s.host_name=? ORDER BY s.started DESC LIMIT 1")
+    ok = skip = 0
+    okbytes = 0
+    dirs = set()
+    for target in args:
+        ap = os.path.abspath(target)
+        if os.path.islink(ap) or not os.path.exists(ap):
+            print("SKIP (missing or symlink): %s" % target)
+            skip += 1
+            continue
+        if os.path.isdir(ap):
+            files = []
+            for root, _dns, fns in os.walk(ap):
+                dirs.add(root)
+                for fn in fns:
+                    fp = os.path.join(root, fn)
+                    if os.path.islink(fp) or not os.path.isfile(fp):
+                        continue
+                    files.append(fp)
+        else:
+            files = [ap]
+            dirs.add(os.path.dirname(ap))
+        for fp in files:
+            rel = fp.lstrip("/")
+            try:
+                st = os.stat(fp)
+            except OSError as e:
+                print("SKIP (stat failed: %s): %s" % (e, fp))
+                skip += 1
+                continue
+            row = c.execute(q, (rel, host)).fetchone()
+            if not row:
+                print("SKIP (not in index): %s" % fp)
+                skip += 1
+                continue
+            isize, imtime, status, tape = row
+            if status != 1:
+                print("SKIP (session not committed): %s" % fp)
+                skip += 1
+                continue
+            if isize != st.st_size:
+                print("SKIP (size changed: index %s, disk %s): %s"
+                      % (human(isize or 0), human(st.st_size), fp))
+                skip += 1
+                continue
+            if imtime is None or int(imtime) != int(st.st_mtime):
+                print("SKIP (mtime changed: index %s, disk %s): %s"
+                      % (imtime, int(st.st_mtime), fp))
+                skip += 1
+                continue
+            if not tape or not c.execute(
+                    "SELECT 1 FROM tapes WHERE cid=?", (tape,)).fetchone():
+                print("SKIP (tape %s not in index): %s" % (tape or "-", fp))
+                skip += 1
+                continue
+            if yes:
+                try:
+                    os.unlink(fp)
+                except OSError as e:
+                    print("ERROR (%s): %s" % (e, fp))
+                    skip += 1
+                    continue
+                print("DELETED %s  [%s]" % (fp, tape))
+            else:
+                print("WOULD DELETE %s  [%s]" % (fp, tape))
+            ok += 1
+            okbytes += st.st_size
+    if prune and yes:
+        for d in sorted(dirs, key=len, reverse=True):
+            try:
+                if os.path.isdir(d) and not os.listdir(d):
+                    os.rmdir(d)
+            except OSError:
+                pass
+    c.close()
+    print("---")
+    print("%s %d file(s), %s%s" % (
+        "removed" if yes else "would remove", ok, human(okbytes),
+        "" if yes else "  (dry run; add --yes to delete)"))
+    if skip:
+        print("skipped %d file(s)" % skip)
+
+
 def cmd_tapes(ctx, args):
     c = db_open(ctx)
     rows = c.execute(
@@ -2192,6 +2293,8 @@ Commands:
   runs                        list runs (chunked backup sets)
   erase [-y] [--force] [--long]   ERASE tape and delete its sessions from index
   forget --tape CID [--force]     remove a tape's sessions from THIS index only
+  remove [--yes] [--prune-dirs] PATH...
+                              delete local files already backed up unchanged
   scan                        read tape's index blocks into local DB
   monitor [--interval N] [--log FILE] [--once]
                               watch drive temperature/humidity TapeAlert flags
@@ -2259,6 +2362,8 @@ def main():
             cmd_monitor(ctx, args)
         elif cmd == "temp":
             cmd_monitor(ctx, args + ["--once"])
+        elif cmd == "remove":
+            cmd_remove(ctx, args)
         elif cmd == "tapes":
             cmd_tapes(ctx, args)
         elif cmd == "sessions":
