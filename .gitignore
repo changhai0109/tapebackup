@@ -1,0 +1,10 @@
+# index database (large binary, stays on this host)
+index.db
+index.db-*
+runs/
+
+# logs and scratch
+*.log
+temp.log
+__pycache__/
+*.pyc

@@ -1,0 +1,2205 @@
+#!/usr/bin/env python3
+# tapebackup v2 — LTO backup with a SQLite index, MAM-aware tape identity,
+# multivolume tar spanning, on-tape TSV index blocks, dry-run, remote drive support.
+#
+# Model:
+#   - Index DB lives on the ISSUING host (~/tapebackup/index.db).
+#   - Tape identity comes from MAM: canonical id "MANUFACTURER:SERIAL".
+#     Human label = MAM barcode (0x0806) when present.
+#   - Tape layout (per tape):
+#       file 1      : TAPEHDR/README.txt        (only on session-start tape)
+#       file 2..k   : tar data archives         (may span to next tape at file 1)
+#       last file   : TAPEIDX.<n>/...           (TSV index block, append-log)
+#   - On-tape index blocks are a superseding append-log: rebuild = replay in
+#     tape order, later rows win (per-key). No fixed reservation, no seeks.
+#
+# Environment:
+#   TAPEBACKUP_DIR       default ~/tapebackup
+#   TAPEBACKUP_DEV       default /dev/nst0
+#   TAPEBACKUP_RHOST     remote drive host (uses ssh+rmt); empty = local drive
+#   TAPEBACKUP_RPORT     ssh port for remote host
+#   TAPEBACKUP_RUSER     ssh user
+#   TAPEBACKUP_RDEV      remote device, default /dev/nst0
+#   TAPEBACKUP_VOL_KIB   per-volume size for tar -L (KiB), default 2400000
+
+import argparse
+import ctypes
+import fcntl
+import getpass
+import json
+import os
+import re
+import shlex
+import socket
+import sqlite3
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+
+BS = 2048  # 1 MiB tar blocks: fewer rmt round-trips over high-latency links
+DEFAULT_VOL_KIB = 2400000000   # KiB -> ~2.23 TiB (tar -L unit is KiB)
+SELF = os.path.abspath(__file__)
+
+# ---------------------------------------------------------------- utilities
+
+
+_T0 = time.time()
+
+
+def tick(tag):
+    if os.environ.get("TAPEBACKUP_TIMING"):
+        print("[t %6.2fs] %s" % (time.time() - _T0, tag), flush=True)
+
+
+def die(msg):
+    print("ERROR: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg):
+    print("WARNING: %s" % msg, file=sys.stderr)
+
+
+def run(cmd, check=True, input=None, tty=False, timeout=None):
+    if tty:
+        return subprocess.run(cmd, input=input, text=True, timeout=timeout)
+    r = subprocess.run(cmd, input=input, text=True, capture_output=True,
+                       timeout=timeout)
+    if check and r.returncode != 0:
+        sys.stderr.write(r.stdout or "")
+        sys.stderr.write(r.stderr or "")
+        die("command failed (%d): %s" % (r.returncode, " ".join(map(str, cmd))))
+    return r
+
+
+def human(n):
+    if n is None:
+        return "?"
+    n = float(n)
+    for u in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or u == "TiB":
+            return ("%.1f %s" % (n, u)) if u != "B" else ("%d B" % n)
+        n /= 1024.0
+
+
+def esc(s):
+    return str(s).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+
+
+def unesc(s):
+    out, i = [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            out.append({"t": "\t", "n": "\n", "\\": "\\"}.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def uuid4():
+    try:
+        with open("/proc/sys/kernel/random/uuid") as f:
+            return f.read().strip()
+    except OSError:
+        return str(uuid.uuid4())
+
+
+# ---------------------------------------------------------------- MAM (SG_IO)
+
+SG_IO = 0x2285
+SG_DXFER_FROM_DEV = -3
+SG_DXFER_NONE = -1
+
+
+class SgIoHdr(ctypes.Structure):
+    _fields_ = [
+        ("interface_id", ctypes.c_int),
+        ("dxfer_direction", ctypes.c_int),
+        ("cmd_len", ctypes.c_ubyte),
+        ("mx_sb_len", ctypes.c_ubyte),
+        ("iovec_count", ctypes.c_ushort),
+        ("dxfer_len", ctypes.c_uint),
+        ("dxferp", ctypes.c_void_p),
+        ("cmdp", ctypes.c_void_p),
+        ("sbp", ctypes.c_void_p),
+        ("timeout", ctypes.c_uint),
+        ("flags", ctypes.c_uint),
+        ("pack_id", ctypes.c_int),
+        ("usr_ptr", ctypes.c_void_p),
+        ("status", ctypes.c_ubyte),
+        ("masked_status", ctypes.c_ubyte),
+        ("msg_status", ctypes.c_ubyte),
+        ("sb_len_wr", ctypes.c_ubyte),
+        ("host_status", ctypes.c_ushort),
+        ("driver_status", ctypes.c_ushort),
+        ("resid", ctypes.c_int),
+        ("duration", ctypes.c_uint),
+        ("info", ctypes.c_uint),
+    ]
+
+
+MAM_NAMES = {
+    0x0000: "remaining_mb", 0x0001: "max_mb", 0x0002: "tapealert",
+    0x0003: "load_count", 0x0005: "assign_org", 0x0006: "formatted_density",
+    0x0007: "init_count", 0x0008: "volume_id", 0x0009: "vcr",
+    0x020A: "last_drive_id", 0x0220: "lifetime_written_mb",
+    0x0221: "lifetime_read_mb",
+    0x0400: "manufacturer", 0x0401: "medium_serial", 0x0404: "medium_assign_org",
+    0x0405: "medium_density", 0x0406: "manuf_date", 0x0407: "mam_capacity",
+    0x0408: "medium_type", 0x0800: "app_vendor", 0x0801: "app_name",
+    0x0802: "app_version", 0x0803: "volume_label", 0x0806: "barcode",
+    0x080B: "app_format_version", 0x080C: "vci", 0x0820: "ltfs_uuid",
+    0x1000: "uci", 0x1001: "auci", 0x1623: "volume_locked",
+}
+
+ASCII_ATTRS = {0x0005, 0x0008, 0x0400, 0x0401, 0x0404, 0x0406, 0x0806,
+               0x0800, 0x0801, 0x0802, 0x080B, 0x020A, 0x020B, 0x020C, 0x020D}
+
+
+def sg_issue(fd, cdb, alloc, direction=SG_DXFER_FROM_DEV, timeout_ms=60000):
+    buf = ctypes.create_string_buffer(alloc)
+    sb = ctypes.create_string_buffer(64)
+    cdb_buf = ctypes.create_string_buffer(bytes(cdb), len(cdb))
+    hdr = SgIoHdr()
+    hdr.interface_id = ord("S")
+    hdr.dxfer_direction = direction
+    hdr.cmd_len = len(cdb)
+    hdr.mx_sb_len = 64
+    hdr.dxfer_len = alloc
+    hdr.dxferp = ctypes.cast(buf, ctypes.c_void_p)
+    hdr.cmdp = ctypes.cast(cdb_buf, ctypes.c_void_p)
+    hdr.sbp = ctypes.cast(sb, ctypes.c_void_p)
+    hdr.timeout = timeout_ms
+    fcntl.ioctl(fd, SG_IO, hdr)
+    if hdr.status != 0:
+        return None, bytes(sb.raw[: hdr.sb_len_wr or 0])
+    got = alloc - hdr.resid
+    return buf.raw[:got], b""
+
+
+def sg_read_attributes(sgpath, service_action, first=0, alloc=8192, cache=1):
+    cdb = bytearray(16)
+    cdb[0] = 0x8C
+    cdb[1] = service_action & 0x1F
+    cdb[8] = (first >> 8) & 0xFF
+    cdb[9] = first & 0xFF
+    cdb[10:14] = alloc.to_bytes(4, "big")
+    cdb[14] = cache & 0x01
+    fd = os.open(sgpath, os.O_RDWR)
+    try:
+        return sg_issue(fd, cdb, alloc)
+    finally:
+        os.close(fd)
+
+
+def mam_attrs(sgpath):
+    data, sense = sg_read_attributes(sgpath, 0x00, 0, 8192)
+    if data is None:
+        raise RuntimeError("READ ATTRIBUTE SA=0 failed (sense %s)" % sense.hex())
+    avail = int.from_bytes(data[0:4], "big")
+    attrs = {}
+    i = 4
+    end = min(len(data), 4 + avail)
+    while i + 5 <= end:
+        aid = int.from_bytes(data[i:i + 2], "big")
+        ln = int.from_bytes(data[i + 3:i + 5], "big")
+        attrs[aid] = data[i + 5:i + 5 + ln]
+        i += 5 + ln
+    return attrs
+
+
+def sg_name_for_st(stdev):
+    base = os.path.basename(os.path.realpath(stdev))
+    for cand in (base, base.replace("nst", "st")):
+        d = "/sys/class/scsi_tape/%s/device/scsi_generic" % cand
+        if os.path.isdir(d):
+            names = sorted(os.listdir(d))
+            if names:
+                return "/dev/" + names[0]
+    raise RuntimeError("cannot find sg node for %s" % stdev)
+
+
+def sg_tur(fd):
+    data, sense = sg_issue(fd, bytes(6), 0, SG_DXFER_NONE)
+    return (data is not None), sense
+
+
+def drive_wait_ready(stdev, timeout=150):
+    """Ensure medium is loaded/ready; auto-issues LOAD if needed."""
+    sg = sg_name_for_st(stdev)
+    fd = os.open(sg, os.O_RDWR)
+    try:
+        ok, sense = sg_tur(fd)
+        if not ok:
+            key = (sense[2] & 0x0F) if len(sense) > 2 else 0
+            asc = sense[12] if len(sense) > 12 else 0
+            if key == 0x02 and asc == 0x3A:
+                return False, "no cartridge present"
+            sg_issue(fd, bytes([0x1B, 0, 0, 0, 1, 0]), 0, SG_DXFER_NONE)   # LOAD
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                time.sleep(5)
+                ok, sense = sg_tur(fd)
+                if ok:
+                    break
+            if not ok:
+                return False, "medium not ready (sense %s)" % sense.hex()
+        return True, ""
+    finally:
+        os.close(fd)
+
+
+def sg_erase_dev(stdev, long=False):
+    sg = sg_name_for_st(stdev)
+    fd = os.open(sg, os.O_RDWR)
+    try:
+        cdb = bytes([0x19, 1 if long else 0, 0, 0, 0, 0])
+        data, sense = sg_issue(fd, cdb, 0, SG_DXFER_NONE, timeout_ms=7200000)
+        return data is not None, sense
+    finally:
+        os.close(fd)
+
+
+def mam_snapshot(stdev):
+    sg = sg_name_for_st(stdev)
+    attrs = mam_attrs(sg)
+    out = {}
+    for aid, name in MAM_NAMES.items():
+        if aid not in attrs:
+            continue
+        raw = attrs[aid]
+        if aid in ASCII_ATTRS:
+            out[name] = raw.decode("ascii", "replace").strip("\x00 ").strip()
+        elif aid in (0x0000, 0x0001, 0x0220, 0x0221, 0x0003, 0x0007, 0x0407):
+            out[name] = int.from_bytes(raw, "big")
+        elif aid == 0x0803:
+            txt = "".join(chr(c) if 32 <= c < 127 else "" for c in raw)
+            out[name] = txt.strip()
+        elif aid == 0x080C and len(raw) >= 24:
+            out["vci_gen"] = int.from_bytes(raw[8:16], "big")
+            out["vci_block"] = int.from_bytes(raw[16:24], "big")
+            m = re.search(rb"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", raw)
+            if m:
+                out["ltfs_uuid"] = m.group(1).decode()
+        else:
+            out[name] = raw.hex()
+    m = out.get("manufacturer") or ""
+    s = out.get("medium_serial") or ""
+    out["canonical_id"] = ("%s:%s" % (m, s)) if (m and s) else ""
+    return out
+
+
+# ---------------------------------------------------------------- context
+
+
+class Ctx:
+    def __init__(self, dry=False):
+        self.dir = os.path.expanduser(os.environ.get("TAPEBACKUP_DIR", "~/tapebackup"))
+        self.dbpath = os.path.join(self.dir, "index.db")
+        self.dev = os.environ.get("TAPEBACKUP_DEV", "/dev/nst0")
+        self.rhost = os.environ.get("TAPEBACKUP_RHOST", "")
+        self.rport = os.environ.get("TAPEBACKUP_RPORT", "")
+        self.ruser = os.environ.get("TAPEBACKUP_RUSER", "")
+        self.rdev = os.environ.get("TAPEBACKUP_RDEV", "/dev/nst0")
+        self.vol_kib = int(os.environ.get("TAPEBACKUP_VOL_KIB", DEFAULT_VOL_KIB))
+        self.rmt = os.environ.get("TAPEBACKUP_RMT", "/usr/sbin/rmt")
+        self.dry = dry
+        self.rate = 0
+        self.host_uuid = self._machine_id()
+        self.host_name = self._host_name()
+        self._locks = []
+        self.rhost_tar = None
+        self.ruser_eff = None
+
+    # ----- identity
+    @staticmethod
+    def _machine_id():
+        for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            try:
+                with open(p) as f:
+                    v = f.read().strip()
+                    if v:
+                        return v
+            except OSError:
+                pass
+        return socket.gethostname()
+
+    def _host_name(self):
+        try:
+            with open(os.path.join(self.dir, "host.conf")) as f:
+                for line in f:
+                    if line.startswith("host_name="):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        return socket.gethostname()
+
+    # ----- ssh
+    def _ssh_base(self, mux=False):
+        a = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+             "-c", "aes128-gcm@openssh.com"]
+        if mux:
+            a += ["-o", "ControlMaster=auto",
+                  "-o", "ControlPath=/tmp/tapebackup-ssh-%r@%h:%p",
+                  "-o", "ControlPersist=600"]
+        if self.rport:
+            a += ["-p", str(self.rport)]
+        if self.ruser:
+            a += ["-l", self.ruser]
+        a.append(self.rhost)
+        return a
+
+    def ssh_argv(self):
+        return self._ssh_base(mux=True)
+
+    def ssh_argv_stream(self):
+        return self._ssh_base(mux=False)
+
+    def drive_run(self, local_argv, remote_cmd):
+        """Run a drive-host command; returns CompletedProcess."""
+        if self.dry:
+            shown = remote_cmd if self.rhost else " ".join(map(str, local_argv))
+            print("[dry-run] drive: %s" % shown)
+            return subprocess.CompletedProcess([], 0, "", "")
+        if self.rhost:
+            return run(self.ssh_argv() + [remote_cmd])
+        return run(local_argv)
+
+    # ----- mt
+    def mt(self, *args, check=True):
+        a = [str(x) for x in args]
+        if self.rhost:
+            cmd = "sudo mt -f %s %s" % (shlex.quote(self.rdev),
+                                        " ".join(shlex.quote(x) for x in a))
+            if self.dry:
+                print("[dry-run] drive: %s" % cmd)
+                return ""
+            r = run(self.ssh_argv() + [cmd], check=check, timeout=1800)
+        else:
+            if self.dry:
+                print("[dry-run] mt -f %s %s" % (self.dev, " ".join(a)))
+                return ""
+            r = run(["sudo", "mt", "-f", self.dev] + a, check=check, timeout=1800)
+        return r.stdout
+
+    def mt_try(self, *args):
+        try:
+            self.mt(*args, check=True)
+            return True
+        except SystemExit:
+            return False
+
+    # ----- tar
+    def prep_remote(self):
+        """Resolve the real hostname (tar needs DNS) and build an ssh wrapper
+        that works when tar runs under sudo (tar's rsh needs root to drop privs)."""
+        if self.rhost_tar:
+            return
+        host, user = self.rhost, self.ruser
+        r = run(["ssh", "-G", self.rhost], check=False)
+        for line in r.stdout.splitlines():
+            if line.startswith("hostname "):
+                host = line.split(None, 1)[1].strip()
+            elif line.startswith("user ") and not user:
+                user = line.split(None, 1)[1].strip()
+        self.rhost_tar = host
+        self.ruser_eff = user or getpass.getuser()
+        if run(["sudo", "-n", "true"], check=False).returncode != 0:
+            die("remote mode needs passwordless sudo locally (tar's rmt requires root)")
+        home = os.path.expanduser("~")
+        key = None
+        for k in ("id_ed25519", "id_rsa", "id_ecdsa"):
+            cand = os.path.join(home, ".ssh", k)
+            if os.path.exists(cand):
+                key = cand
+                break
+        opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                "-c", "aes128-gcm@openssh.com",
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPath=/tmp/tapebackup-ssh-%r@%h:%p",
+                "-o", "ControlPersist=600"]
+        if self.rport:
+            opts += ["-p", str(self.rport)]
+        opts += ["-l", self.ruser_eff]
+        if key:
+            opts += ["-i", key, "-o", "IdentitiesOnly=yes"]
+        wrapper = os.path.join(self.dir, "rmtssh")
+        os.makedirs(self.dir, exist_ok=True)
+        content = "#!/bin/sh\nexec ssh %s \"$@\"\n" % " ".join(shlex.quote(o) for o in opts)
+        try:
+            old = open(wrapper).read()
+        except OSError:
+            old = None
+        if old != content:
+            with open(wrapper, "w") as f:
+                f.write(content)
+            os.chmod(wrapper, 0o755)
+        self.rsh_wrapper = wrapper
+
+    def tar_argv(self):
+        if self.rhost:
+            self.prep_remote()
+            return ["sudo", "tar", "-f", "%s:%s" % (self.rhost_tar, self.rdev),
+                    "--rsh-command=%s" % self.rsh_wrapper,
+                    "--rmt-command=%s" % self.rmt], "remote"
+        if os.access(self.dev, os.W_OK):
+            return ["tar", "-f", self.dev], "local"
+        return ["sudo", "tar", "-f", self.dev], "local"
+
+    def stream_write(self, items=None, cwd=None, listfile=None):
+        """tar -> [pv -L rate] -> ssh dd. Much faster than rmt on high-latency links."""
+        cmd = ["tar", "-c", "-b%d" % BS]
+        if listfile:
+            cmd += ["--null", "-T", listfile]
+        elif items:
+            if cwd:
+                cmd += ["-C", cwd]
+            cmd += list(items)
+        cmd += ["-f", "-"]
+        dd = "sudo dd of=%s bs=1M iflag=fullblock 2>/dev/null" % shlex.quote(self.rdev)
+        p1 = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        src = p1.stdout
+        pv = None
+        rate = getattr(self, "rate", 0)
+        if rate:
+            pv = subprocess.Popen(["pv", "-q", "-B", "1M", "-L", str(int(rate))],
+                                  stdin=src, stdout=subprocess.PIPE)
+            src.close()
+            src = pv.stdout
+        p2 = subprocess.Popen(self.ssh_argv_stream() + [dd], stdin=src)
+        src.close()
+        rc2 = p2.wait()
+        rcv = pv.wait() if pv else 0
+        rc1 = p1.wait()
+        if rcv not in (0, None):
+            rc1 = rc1 or rcv
+        return rc1, rc2
+
+    def stream_read(self, dest, paths=()):
+        """ssh dd -> tar -x. Returns (ssh_rc, tar_rc)."""
+        dd = "sudo dd if=%s bs=1M iflag=fullblock 2>/dev/null" % shlex.quote(self.rdev)
+        p1 = subprocess.Popen(self.ssh_argv_stream() + [dd], stdout=subprocess.PIPE)
+        cmd = ["tar", "-x", "-b%d" % BS, "-C", dest, "-f", "-"] + list(paths)
+        p2 = subprocess.Popen(cmd, stdin=p1.stdout)
+        p1.stdout.close()
+        rc2 = p2.wait()
+        rc1 = p1.wait()
+        return rc1, rc2
+
+    def tar(self, args, check=True):
+        base, _ = self.tar_argv()
+        cmd = base + ["-b%d" % BS] + list(args)
+        if self.dry:
+            print("[dry-run] tar %s" % " ".join(shlex.quote(x) for x in cmd[1:]))
+            return subprocess.CompletedProcess([], 0, "", "")
+        return run(cmd, check=check)
+
+    def sg_erase(self, long=False):
+        src = open(SELF).read()
+        mode = "long" if long else "quick"
+        if self.rhost:
+            argv = self.ssh_argv() + ["sudo python3 - _erase %s %s" % (shlex.quote(self.rdev), mode)]
+        else:
+            argv = ["sudo", "python3", "-", "_erase", self.dev, mode]
+        r = run(argv, input=src, check=False, timeout=None)
+        try:
+            j = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:
+            j = {"erased": False, "error": (r.stderr or r.stdout).strip()[:300]}
+        if not j.get("erased"):
+            die("erase failed: %s" % (j.get("error") or j.get("sense") or "unknown"))
+
+    def _mt_probe(self, *args, timeout=25):
+        try:
+            if self.rhost:
+                cmd = "sudo mt -f %s %s" % (shlex.quote(self.rdev),
+                                            " ".join(shlex.quote(a) for a in args))
+                r = run(self.ssh_argv() + [cmd], check=False, timeout=timeout)
+            else:
+                r = run(["sudo", "mt", "-f", self.dev] + list(args),
+                        check=False, timeout=timeout)
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def _sg_load(self):
+        src = open(SELF).read()
+        if self.rhost:
+            argv = self.ssh_argv() + ["sudo python3 - _load %s" % shlex.quote(self.rdev)]
+        else:
+            argv = ["sudo", "python3", "-", "_load", self.dev]
+        run(argv, input=src, check=False)
+
+    def ensure_ready(self):
+        """Ensure the medium is loaded/ready using SG_IO only (no st open).
+
+        Opening the st device while the drive is mid-load can wedge the driver,
+        so the readiness probe must never touch /dev/nst*."""
+        if self.dry:
+            print("[dry-run] would ensure tape is loaded/ready")
+            return
+        src = open(SELF).read()
+        if self.rhost:
+            argv = self.ssh_argv() + ["sudo python3 - _ready %s" % shlex.quote(self.rdev)]
+        else:
+            argv = ["sudo", "python3", "-", "_ready", self.dev]
+        r = run(argv, input=src, check=False, timeout=300)
+        try:
+            j = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:
+            j = {"ready": False, "msg": (r.stderr or r.stdout).strip()[:200]}
+        if not j.get("ready"):
+            die("tape not ready: %s" % (j.get("msg") or j.get("error") or
+                                        "no cartridge, or drive needs a power cycle"))
+
+    # ----- db
+    def db(self):
+        os.makedirs(self.dir, exist_ok=True)
+        c = sqlite3.connect(self.dbpath)
+        c.execute("PRAGMA journal_mode=WAL")
+        return c
+
+    # ----- lock
+    def lock(self):
+        """flock held by a long-lived child; released automatically if we die."""
+        if self.dry:
+            print("[dry-run] would acquire drive lock")
+            return
+        lockpath = "/tmp/tapebackup.drive.lock" if self.rhost else os.path.join(self.dir, "drive.lock")
+        inner = "flock -x -w 5 %s sh -c 'echo LOCKED; cat >/dev/null'" % shlex.quote(lockpath)
+        if self.rhost:
+            p = subprocess.Popen(self.ssh_argv() + [inner], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        else:
+            os.makedirs(self.dir, exist_ok=True)
+            p = subprocess.Popen(["flock", "-x", "-w", "5", lockpath,
+                                  "sh", "-c", "echo LOCKED; cat >/dev/null"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        line = p.stdout.readline()
+        if line.strip() != b"LOCKED":
+            try:
+                p.kill()
+            except Exception:
+                pass
+            die("drive is locked by another process")
+        self._locks.append(("flock", p, None))
+
+    def unlock(self):
+        for item in self._locks:
+            kind, obj, path = item
+            if kind == "local":
+                try:
+                    fcntl.flock(obj, fcntl.LOCK_UN)
+                    obj.close()
+                except OSError:
+                    pass
+            elif kind == "flock":
+                try:
+                    obj.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    obj.wait(timeout=5)
+                except Exception:
+                    try:
+                        obj.terminate()
+                    except Exception:
+                        pass
+            else:
+                run(self.ssh_argv() + ["rm -f %s" % path], check=False)
+        self._locks = []
+
+# ---------------------------------------------------------------- schema
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS tapes(
+  cid TEXT PRIMARY KEY, barcode TEXT, created TEXT, created_by TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS runs(
+  run_id TEXT PRIMARY KEY, started TEXT, finished TEXT, source TEXT,
+  chunk_bytes INTEGER, n_chunks INTEGER, status INTEGER);
+CREATE TABLE IF NOT EXISTS sessions(
+  sid TEXT PRIMARY KEY, host_uuid TEXT, host_name TEXT,
+  started TEXT, finished TEXT, paths TEXT,
+  est_size INTEGER, est_files INTEGER, status INTEGER,
+  run_id TEXT, chunk_seq INTEGER);
+CREATE TABLE IF NOT EXISTS session_tapes(
+  sid TEXT, seq INTEGER, tape TEXT, file_no INTEGER, PRIMARY KEY(sid,seq));
+CREATE TABLE IF NOT EXISTS file_index(
+  sid TEXT, path TEXT, size INTEGER, mtime INTEGER, PRIMARY KEY(sid,path));
+CREATE INDEX IF NOT EXISTS ix_fi_path ON file_index(path);
+"""
+
+
+def _migrate(c):
+    c.executescript(SCHEMA)
+    cols = [r[1] for r in c.execute("PRAGMA table_info(sessions)")]
+    if "run_id" not in cols:
+        c.execute("ALTER TABLE sessions ADD COLUMN run_id TEXT")
+    if "chunk_seq" not in cols:
+        c.execute("ALTER TABLE sessions ADD COLUMN chunk_seq INTEGER")
+    fcols = [r[1] for r in c.execute("PRAGMA table_info(file_index)")]
+    if "mtime" not in fcols:
+        c.execute("ALTER TABLE file_index ADD COLUMN mtime INTEGER")
+
+
+def db_init(ctx):
+    os.makedirs(ctx.dir, exist_ok=True)
+    c = ctx.db()
+    _migrate(c)
+    c.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('schema','3')")
+    c.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('db_host_uuid',?)", (ctx.host_uuid,))
+    c.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('db_host_name',?)", (ctx.host_name,))
+    c.commit()
+    c.close()
+
+
+def db_open(ctx):
+    if not os.path.exists(ctx.dbpath):
+        die("index not initialized: run '%s init'" % os.path.basename(SELF))
+    c = sqlite3.connect(ctx.dbpath)
+    c.execute("PRAGMA journal_mode=WAL")
+    _migrate(c)
+    c.commit()
+    return c
+
+
+# ---------------------------------------------------------------- tape ops
+
+
+def sg_path_on_drive(ctx):
+    if ctx.rhost:
+        cmd = "ls /sys/class/scsi_tape/%s/device/scsi_generic 2>/dev/null | head -1" % os.path.basename(ctx.rdev)
+        r = run(ctx.ssh_argv() + [cmd], check=False)
+        n = r.stdout.strip()
+        return ("/dev/" + n) if n else "/dev/sg0"
+    base = os.path.basename(ctx.dev)
+    d = "/sys/class/scsi_tape/%s/device/scsi_generic" % base
+    if os.path.isdir(d):
+        names = sorted(os.listdir(d))
+        if names:
+            return "/dev/" + names[0]
+    return "/dev/sg0"
+
+
+def drive_env_status(ctx):
+    """Read TapeAlert (0x2e) and device statistics (0x14) temperature fields."""
+    sg = sg_path_on_drive(ctx)
+    out = {}
+    wanted = {
+        "0x2e": ("Drive temperature", "Drive humidity", "Drive voltage"),
+        "0x14": ("Lifetime power on hours when last temperature condition occurred",
+                 "Maximum recommended mechanism temperature exceeded"),
+    }
+    for page, keys in wanted.items():
+        cmd = "sudo sg_logs -p %s %s" % (page, sg)
+        if ctx.rhost:
+            r = run(ctx.ssh_argv() + [cmd], check=False)
+        else:
+            r = run(cmd.split(), check=False)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            for k in keys:
+                if line.startswith(k + ":"):
+                    out[k] = line.split(":", 1)[1].strip()
+    return out
+
+
+def tape_id(ctx):
+    """Read MAM from the drive host; returns dict."""
+    if ctx.dry:
+        return {}
+    src = open(SELF).read()
+    if ctx.rhost:
+        argv = ctx.ssh_argv() + ["sudo python3 - _mam %s" % shlex.quote(ctx.rdev)]
+    else:
+        argv = ["sudo", "python3", "-", "_mam", ctx.dev]
+    r = run(argv, input=src, check=False)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip() or "MAM read failed")
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError("bad MAM output: %r" % r.stdout[:200])
+
+
+def tape_state(mam):
+    if not mam:
+        return "unknown"
+    rem, mx = mam.get("remaining_mb"), mam.get("max_mb")
+    if rem and mx and rem == mx:
+        return "blank"
+    if (mam.get("app_name") or "").upper() == "LTFS":
+        return "ltfs"
+    if not mam.get("app_name") and not mam.get("barcode") and not mam.get("medium_serial"):
+        return "blank"
+    return "foreign"
+
+
+def fmt_mam(mam):
+    lines = [
+        ("canonical id", mam.get("canonical_id", "")),
+        ("barcode", mam.get("barcode", "")),
+        ("manufacturer", mam.get("manufacturer", "")),
+        ("medium serial", mam.get("medium_serial", "")),
+        ("manufacture date", mam.get("manuf_date", "")),
+        ("medium type", mam.get("medium_type", "")),
+        ("density", mam.get("formatted_density", "")),
+        ("capacity", "%s used of %s" % (
+            human((mam.get("max_mb", 0) - mam.get("remaining_mb", 0)) * 1024 * 1024),
+            human((mam.get("max_mb", 0)) * 1024 * 1024))),
+        ("app vendor/name/ver", " ".join(
+            x for x in (mam.get("app_vendor"), mam.get("app_name"),
+                        mam.get("app_version")) if x)),
+        ("volume label", mam.get("volume_label", "")),
+        ("LTFS uuid", mam.get("ltfs_uuid", "")),
+        ("load count", mam.get("load_count", "")),
+        ("lifetime written", human((mam.get("lifetime_written_mb") or 0) * 1024 * 1024)),
+        ("tapealert", mam.get("tapealert", "")),
+        ("UCI", mam.get("uci", "")),
+    ]
+    return "\n".join("%-22s %s" % (k, v) for k, v in lines if v not in (None, "", 0))
+
+
+def pos_file(ctx, n):
+    """Seek to 1-based tape file n."""
+    ctx.mt("rewind")
+    if n > 1:
+        ctx.mt("fsf", n - 1)
+
+
+def read_cur(ctx):
+    """Read a short signature from the CURRENT tape position (no seeking)."""
+    dev = ctx.rdev if ctx.rhost else ctx.dev
+    if ctx.rhost:
+        cmd = "sudo dd if=%s bs=4M count=1 2>/dev/null | head -c 120" % shlex.quote(dev)
+        r = subprocess.run(ctx.ssh_argv() + [cmd], capture_output=True)
+        return r.stdout[:120]
+    r = subprocess.run(["sudo", "dd", "if=%s" % dev, "bs=4M", "count=1"],
+                       capture_output=True)
+    return r.stdout[:120]
+
+
+def read_sig(ctx, n):
+    pos_file(ctx, n)
+    return read_cur(ctx)
+
+
+def sig_kind(raw):
+    if raw.startswith(b"TAPEHDR/"):
+        return "hdr"
+    m = re.match(rb"TAPEIDX\.(\d+)/", raw)
+    if m:
+        return "idx", int(m.group(1))
+    return "data"
+
+
+def inventory(ctx):
+    """Walk the tape; returns list of (file_no, kind, block_no)."""
+    ctx.mt("rewind")
+    out = []
+    n = 1
+    while True:
+        raw = read_cur(ctx)
+        if not raw:
+            break
+        k = sig_kind(raw)
+        if isinstance(k, tuple):
+            k, blk = k
+            out.append((n, k, blk))
+        else:
+            out.append((n, k, None))
+        if not ctx.mt_try("fsf", 1):
+            break
+        n += 1
+    return out
+
+
+# ---------------------------------------------------------------- on-tape index blocks
+
+
+def block_dump(ctx, outdir, cid, barcode, fileno, prev):
+    """Create TAPEIDX.<fileno>/ content for sessions touching this tape."""
+    bdir = os.path.join(outdir, "TAPEIDX.%d" % fileno)
+    os.makedirs(bdir, exist_ok=True)
+    c = db_open(ctx)
+    sids = [r[0] for r in c.execute(
+        "SELECT DISTINCT sid FROM session_tapes WHERE tape=?", (cid,))]
+    if not sids:
+        c.close()
+        return None
+    q = "SELECT %s FROM sessions WHERE sid IN (%s)"
+    srow = c.execute(q % ("sid||char(9)||ifnull(host_uuid,'')||char(9)||ifnull(host_name,'')"
+                          "||char(9)||ifnull(started,'')||char(9)||ifnull(finished,'')"
+                          "||char(9)||ifnull(status,0)||char(9)||ifnull(paths,'')"
+                          "||char(9)||ifnull(est_size,0)||char(9)||ifnull(est_files,0)"
+                          "||char(9)||ifnull(run_id,'')||char(9)||ifnull(chunk_seq,'')",
+                          ",".join("?" * len(sids))), sids).fetchall()
+    with open(os.path.join(bdir, "sessions.tsv"), "w") as f:
+        for row in srow:
+            f.write(row[0] + "\n")
+    with open(os.path.join(bdir, "session_tapes.tsv"), "w") as f:
+        for sid, seq, tape, fno in c.execute(
+                "SELECT sid,seq,tape,file_no FROM session_tapes WHERE sid IN (%s) ORDER BY sid,seq"
+                % ",".join("?" * len(sids)), sids):
+            f.write("%s\t%d\t%s\t%d\n" % (esc(sid), seq, esc(tape), fno))
+    with open(os.path.join(bdir, "file_index.tsv"), "w") as f:
+        for sid, path, size, mt in c.execute(
+                "SELECT sid,path,size,mtime FROM file_index WHERE sid IN (%s)"
+                % ",".join("?" * len(sids)), sids):
+            f.write("%s\t%s\t%d\t%s\n" % (esc(sid), esc(path), size,
+                                             "" if mt is None else mt))
+    cids = [r[0] for r in c.execute(
+        "SELECT DISTINCT tape FROM session_tapes WHERE sid IN (%s)"
+        % ",".join("?" * len(sids)), sids)]
+    run_ids = [r[0] for r in c.execute(
+        "SELECT DISTINCT run_id FROM sessions WHERE sid IN (%s) AND run_id IS NOT NULL"
+        % ",".join("?" * len(sids)), sids)]
+    if run_ids:
+        with open(os.path.join(bdir, "runs.tsv"), "w") as f:
+            for row in c.execute("SELECT run_id,started,finished,source,chunk_bytes,n_chunks,status"
+                                 " FROM runs WHERE run_id IN (%s)" % ",".join("?" * len(run_ids)),
+                                 run_ids):
+                f.write("\t".join(esc(x if x is not None else "") for x in row) + "\n")
+    with open(os.path.join(bdir, "tapes.tsv"), "w") as f:
+        for (tid,) in c.execute("SELECT cid FROM tapes WHERE cid IN (%s)"
+                                % ",".join("?" * len(cids)), cids):
+            row = c.execute("SELECT cid,barcode,created,created_by FROM tapes WHERE cid=?",
+                            (tid,)).fetchone()
+            f.write("\t".join(esc(x or "") for x in row) + "\n")
+    c.close()
+    with open(os.path.join(bdir, "meta.txt"), "w") as f:
+        f.write("tapebackup-index-block 1\n")
+        f.write("tape: %s\n" % cid)
+        f.write("barcode: %s\n" % (barcode or ""))
+        f.write("block_file: %d\n" % fileno)
+        f.write("prev_block: %s\n" % ("" if prev is None else prev))
+        f.write("writer: %s (%s)\n" % (ctx.host_name, ctx.host_uuid))
+        f.write("date: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    return bdir
+
+
+def block_merge(ctx, bdir, tape_cid_hint=None):
+    """Merge one TAPEIDX.<n> directory into the DB (latest wins)."""
+    c = db_open(ctx)
+    try:
+        p = os.path.join(bdir, "sessions.tsv")
+        if os.path.exists(p):
+            for line in open(p):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 11:
+                    sid, hu, hn, st, fin, status, paths, esz, efc, rid, cseq = parts[:11]
+                else:
+                    sid, hu, hn, st, fin, status, paths, esz, efc = parts[:9]
+                    rid, cseq = "", ""
+                c.execute("INSERT OR REPLACE INTO sessions"
+                          "(sid,host_uuid,host_name,started,finished,paths,est_size,"
+                          "est_files,status,run_id,chunk_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                          (sid, hu, hn, st, fin, unesc(paths),
+                           int(esz or 0), int(efc or 0), int(status or 0),
+                           rid or None, int(cseq) if cseq else None))
+        p = os.path.join(bdir, "session_tapes.tsv")
+        if os.path.exists(p):
+            for line in open(p):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                sid, seq, tape, fno = line.split("\t")
+                c.execute("INSERT OR REPLACE INTO session_tapes VALUES(?,?,?,?)",
+                          (sid, int(seq), unesc(tape), int(fno)))
+        p = os.path.join(bdir, "file_index.tsv")
+        if os.path.exists(p):
+            for line in open(p):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                sid, path, size = parts[0], parts[1], parts[2]
+                mt = int(parts[3]) if len(parts) > 3 and parts[3] else None
+                c.execute("INSERT OR REPLACE INTO file_index(sid,path,size,mtime)"
+                          " VALUES(?,?,?,?)", (sid, unesc(path), int(size), mt))
+        p = os.path.join(bdir, "runs.tsv")
+        if os.path.exists(p):
+            for line in open(p):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = [unesc(x) for x in (line.split("\t") + [""] * 7)[:7]]
+                c.execute("INSERT OR REPLACE INTO runs VALUES(?,?,?,?,?,?,?)",
+                          (parts[0], parts[1], parts[2] or None, parts[3],
+                           int(parts[4] or 0), int(parts[5] or 0), int(parts[6] or 0)))
+        p = os.path.join(bdir, "tapes.tsv")
+        if os.path.exists(p):
+            for line in open(p):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                cid, bc, created, by = (line.split("\t") + [""] * 4)[:4]
+                c.execute("INSERT OR IGNORE INTO tapes(cid,barcode,created,created_by)"
+                          " VALUES(?,?,?,?)", (unesc(cid), unesc(bc), unesc(created), unesc(by)))
+        c.commit()
+    finally:
+        c.close()
+
+
+def scan_tape(ctx):
+    """Inventory + merge all index blocks. Returns (cid_from_blocks, inv)."""
+    inv = inventory(ctx)
+    cids = []
+    tmp = tempfile.mkdtemp(prefix="tbscan.")
+    try:
+        for n, kind, blk in inv:
+            if kind != "idx":
+                continue
+            pos_file(ctx, n)
+            name = "TAPEIDX.%d" % blk
+            ctx.tar(["-x", "-C", tmp, name])
+            bdir = os.path.join(tmp, name)
+            block_merge(ctx, bdir)
+            mtxt = os.path.join(bdir, "meta.txt")
+            if os.path.exists(mtxt):
+                for line in open(mtxt):
+                    if line.startswith("tape: "):
+                        cids.append(line[6:].strip())
+    finally:
+        subprocess.run(["rm", "-rf", tmp])
+    return (cids[-1] if cids else None), inv
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_init(ctx, args):
+    db_init(ctx)
+    print("initialized: %s" % ctx.dbpath)
+    print("host: %s (%s)" % (ctx.host_name, ctx.host_uuid))
+
+
+def cmd_set_host(ctx, args):
+    db_init(ctx)
+    name = " ".join(args).strip()
+    if not name:
+        die("usage: set-host NAME")
+    with open(os.path.join(ctx.dir, "host.conf"), "w") as f:
+        f.write("host_name=%s\n" % name)
+    c = db_open(ctx)
+    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('db_host_name',?)", (name,))
+    c.commit()
+    c.close()
+    print("host name set to: %s" % name)
+
+
+def cmd_inspect(ctx, args):
+    ctx.lock()
+    try:
+        return _inspect(ctx, args)
+    finally:
+        ctx.unlock()
+
+
+def _inspect(ctx, args):
+    ctx.ensure_ready()
+    try:
+        mam = tape_id(ctx)
+    except RuntimeError as e:
+        die(str(e))
+    if not mam:
+        die("no MAM data")
+    print(fmt_mam(mam))
+    state = tape_state(mam)
+    cid = mam.get("canonical_id") or ""
+    # refine: our own format?
+    try:
+        raw = read_sig(ctx, 1)
+        if raw.startswith(b"TAPEHDR/"):
+            state = "tapebackup"
+    except SystemExit:
+        pass
+    print("%-22s %s" % ("content state", state))
+    if state == "tapebackup" and cid:
+        c = db_open(ctx)
+        rows = c.execute(
+            "SELECT s.sid,s.started,s.status,s.est_size,st.seq,st.file_no"
+            " FROM session_tapes st JOIN sessions s ON s.sid=st.sid"
+            " WHERE st.tape=? ORDER BY s.started", (cid,)).fetchall()
+        c.close()
+        print("%-22s %d" % ("sessions on tape", len({r[0] for r in rows})))
+        for r in rows:
+            print("  %s  %s  status=%s  %s  file=%d (seq %d)" % (
+                r[0][:8], r[1], r[2], human((r[3] or 0)), r[5], r[4]))
+
+
+def parse_size(v):
+    v = str(v).strip().upper()
+    m = re.match(r"^([0-9.]+)\s*([KMGT]?)(I?B?)$", v)
+    if not m:
+        die("bad size: %s" % v)
+    mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}[m.group(2)]
+    return int(float(m.group(1)) * mult)
+
+
+def build_manifest(sources):
+    files = []
+    for src in sources:
+        if os.path.isdir(src):
+            for root, dirs, fs in os.walk(src):
+                dirs.sort()
+                fs.sort()
+                for fn in fs:
+                    fp = os.path.join(root, fn)
+                    try:
+                        stt = os.lstat(fp)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(stt.st_mode):
+                        continue
+                    files.append((fp, stt.st_size, int(stt.st_mtime)))
+        elif os.path.exists(src):
+            stt = os.stat(src)
+            files.append((src, stt.st_size, int(stt.st_mtime)))
+        else:
+            die("no such path: %s" % src)
+    files.sort()
+    return files
+
+
+def split_chunks(files, chunk_bytes):
+    chunks, cur, cur_sz = [], [], 0
+    for fp, sz, mt in files:
+        if cur and cur_sz + sz > chunk_bytes:
+            chunks.append(cur)
+            cur, cur_sz = [], 0
+        cur.append((fp, sz, mt))
+        cur_sz += sz
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def write_header(ctx, tmp, cid, barcode):
+    hdr = os.path.join(tmp, "hdr")
+    os.makedirs(os.path.join(hdr, "TAPEHDR"), exist_ok=True)
+    with open(os.path.join(hdr, "TAPEHDR", "README.txt"), "w") as f:
+        f.write("tapebackup v3 tape\n")
+        f.write("canonical id: %s\n" % cid)
+        f.write("barcode: %s\n" % barcode)
+        f.write("created: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        f.write("created by: %s (%s)\n" % (ctx.host_name, ctx.host_uuid))
+        f.write("\nData is stored as tar chunks; each chunk is followed by a TAPEIDX block.\n")
+        f.write("Recover with: tapebackup scan\n")
+    if ctx.rhost:
+        r1, r2 = ctx.stream_write(["TAPEHDR"], cwd=hdr)
+        if r2 != 0 or r1 not in (0, 1):
+            die("failed to write tape header (tar %s, dd %s)" % (r1, r2))
+    else:
+        ctx.tar(["-c", "-C", hdr, "TAPEHDR"])
+
+
+def eom_probe(ctx):
+    """Seek to end of recorded data and report where the tail is.
+
+    Returns (next_writable_file, last_file_number, partial) where
+    last_file_number is 0-based (== number of complete files) and partial
+    means the tail was mid-file and we closed it with a filemark."""
+    ctx.mt("rewind")
+    if not ctx.mt_try("eom"):
+        return None
+
+    def _status():
+        out = ctx.mt("status")
+        fn = re.search(r"file number\s*=\s*(\d+)", out or "")
+        bn = re.search(r"block number\s*=\s*(-?\d+)", out or "")
+        return (int(fn.group(1)) if fn else None,
+                int(bn.group(1)) if bn else None)
+
+    fn, bn = _status()
+    if fn is None:
+        return None
+    if bn == 0:
+        return fn + 1, fn, False
+    if not ctx.mt_try("weof", "1"):
+        return None
+    fn2, _ = _status()
+    fn2 = fn2 if fn2 is not None else fn + 1
+    return fn2 + 1, fn2, True
+
+
+def tape_state_full(ctx, mam):
+    state = tape_state(mam)
+    try:
+        if read_sig(ctx, 1).startswith(b"TAPEHDR/"):
+            state = "tapebackup"
+    except SystemExit:
+        pass
+    return state
+
+
+def write_chunk(ctx, run_id, seq, n_chunks, chunk_files, chunk_bytes, force):
+    """Write one chunk: tar file + its own index block, commit DB, release lock."""
+    ctx.lock()
+    tmp = tempfile.mkdtemp(prefix="tbchunk.")
+    try:
+        ctx.ensure_ready()
+        mam = tape_id(ctx)
+        cid = mam.get("canonical_id") or ""
+        if not cid:
+            die("tape has no MAM identity")
+        barcode = mam.get("barcode") or ""
+        state = tape_state_full(ctx, mam)
+        need = sum(sz for _, sz, _ in chunk_files)
+        rem = (mam.get("remaining_mb") or 0) * 1024 * 1024
+        if rem and rem < need + (1 << 30):
+            print("tape nearly full: remaining %s, chunk needs %s"
+                  % (human(rem), human(need)), flush=True)
+            ctx.mt_try("offline")
+            print("Insert a NEW tape, then press ENTER: ", end="", flush=True)
+            sys.stdin.readline()
+            ctx.ensure_ready()
+            mam = tape_id(ctx)
+            cid = mam.get("canonical_id") or ""
+            barcode = mam.get("barcode") or ""
+            state = tape_state_full(ctx, mam)
+            if not cid:
+                die("cannot identify the new tape")
+            if state not in ("blank",):
+                if not force:
+                    die("new tape is not blank (%s); rerun with --force to overwrite it" % state)
+        if state == "tapebackup":
+            c0 = db_open(ctx)
+            row = c0.execute("SELECT max(file_no) FROM session_tapes WHERE tape=?",
+                             (cid,)).fetchone()
+            c0.close()
+            next_file = (row[0] + 2) if (row and row[0]) else 2
+            prev_block = (next_file - 1) if next_file > 2 else None
+            pos_file(ctx, next_file)
+            positioned = False
+            if read_cur(ctx):
+                # unindexed data sits in the slot we wanted to use (partial chunk)
+                warn("found unindexed data at file %d; locating tape end ..." % next_file)
+                probe = eom_probe(ctx)
+                if probe is None:
+                    die("cannot determine the end of recorded data")
+                nf_eod, last_fn, partial = probe
+                tail_index = last_fn + 1 if partial else last_fn
+                if tail_index == next_file:
+                    # the unindexed partial chunk is the last file: truncate & reuse
+                    print("reclaiming partial chunk at file %d (quick erase) ..."
+                          % next_file, flush=True)
+                    pos_file(ctx, next_file)
+                    ctx.sg_erase(long=False)
+                    positioned = True   # already at the reclaimed position
+                else:
+                    warn("valid data exists after the partial chunk; appending at file %d"
+                         % nf_eod)
+                    next_file = nf_eod
+                    prev_block = None
+                    positioned = True   # eom left us at end of data
+        elif state == "blank" or force:
+            ctx.mt("rewind")
+            write_header(ctx, tmp, cid, barcode)
+            next_file = 2
+            prev_block = None
+        else:
+            die("tape contains %s data; use --force to overwrite" % state)
+
+        listf = os.path.join(tmp, "chunk.list")
+        with open(listf, "wb") as f:
+            for fp, _, _ in chunk_files:
+                f.write(fp.encode("utf-8", "surrogateescape") + b"\0")
+        if not locals().get("positioned"):
+            pos_file(ctx, next_file)
+        positioned = False
+        t0 = time.time()
+        if ctx.rhost:
+            r1, r2 = ctx.stream_write(listfile=listf)
+            if r2 != 0:
+                die("remote dd failed (%d)" % r2)
+            if r1 not in (0, 1):
+                die("tar failed (%d)" % r1)
+        else:
+            r = ctx.tar(["-c", "--null", "-T", listf], check=False)
+            if r.returncode not in (0, 1):
+                die("tar failed (%d)" % r.returncode)
+        dt = time.time() - t0
+        size = need
+        print("[chunk %d/%d] %s in %d files -> tape %s file %d (%.0fs, %s/s)"
+              % (seq, n_chunks, human(size), len(chunk_files), cid, next_file, dt,
+                 human(size / dt if dt else 0)), flush=True)
+
+        sid = uuid4()
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        c = db_open(ctx)
+        c.execute("INSERT OR IGNORE INTO tapes(cid,barcode,created,created_by)"
+                  " VALUES(?,?,?,?)",
+                  (cid, barcode, now, "%s (%s)" % (ctx.host_name, ctx.host_uuid)))
+        c.execute("INSERT INTO sessions(sid,host_uuid,host_name,started,finished,paths,"
+                  "est_size,est_files,status,run_id,chunk_seq)"
+                  " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (sid, ctx.host_uuid, ctx.host_name, now, now,
+                   "chunk %d/%d of run %s" % (seq, n_chunks, run_id[:8]),
+                   size, len(chunk_files), 1, run_id, seq))
+        c.execute("INSERT INTO session_tapes VALUES(?,?,?,?)", (sid, 1, cid, next_file))
+        c.executemany("INSERT OR REPLACE INTO file_index(sid,path,size,mtime)"
+                      " VALUES(?,?,?,?)",
+                      [(sid, fp.lstrip("/"), sz, mt) for fp, sz, mt in chunk_files])
+        c.commit()
+        c.close()
+
+        blk_no = next_file + 1
+        bdir = block_dump(ctx, tmp, cid, barcode, blk_no, prev_block)
+        try:
+            if bdir:
+                name = os.path.basename(bdir)
+                if ctx.rhost:
+                    r1, r2 = ctx.stream_write([name], cwd=tmp)
+                    if r2 != 0 or r1 not in (0, 1):
+                        die("failed to write index block (tar %s, dd %s)" % (r1, r2))
+                else:
+                    ctx.tar(["-c", "-C", tmp, name])
+        except SystemExit:
+            c = db_open(ctx)
+            c.execute("DELETE FROM file_index WHERE sid=?", (sid,))
+            c.execute("DELETE FROM session_tapes WHERE sid=?", (sid,))
+            c.execute("DELETE FROM sessions WHERE sid=?", (sid,))
+            c.commit()
+            c.close()
+            raise
+        return sid, cid, next_file
+    finally:
+        subprocess.run(["rm", "-rf", tmp])
+        ctx.unlock()
+
+
+def cmd_write(ctx, args):
+    force = "--force" in args
+    args = [a for a in args if a != "--force"]
+    chunk_bytes = 50 * 1024 ** 3
+    cooldown = 0
+    if "--cooldown" in args:
+        i = args.index("--cooldown")
+        cooldown = int(args[i + 1])
+        del args[i:i + 2]
+    if "--rate" in args:
+        i = args.index("--rate")
+        ctx.rate = int(float(args[i + 1]) * 1024 * 1024)
+        del args[i:i + 2]
+    if "--chunk-size" in args:
+        i = args.index("--chunk-size")
+        chunk_bytes = parse_size(args[i + 1])
+        del args[i:i + 2]
+    label_override = None
+    if "--label" in args:
+        i = args.index("--label")
+        label_override = args[i + 1]
+        del args[i:i + 2]
+    if not args:
+        die("usage: write [--force] [--chunk-size 50G] SRC...")
+    files = build_manifest(args)
+    if not files:
+        die("nothing to back up")
+    chunks = split_chunks(files, chunk_bytes)
+    total = sum(sz for _, sz, _ in files)
+    run_id = uuid4()
+    plan_dir = os.path.join(ctx.dir, "runs", run_id)
+    os.makedirs(plan_dir, exist_ok=True)
+    with open(os.path.join(plan_dir, "plan.tsv"), "w") as f:
+        for seq, chunk in enumerate(chunks, 1):
+            for fp, sz, mt in chunk:
+                f.write("%d\t%s\t%d\t%d\n" % (seq, esc(fp), sz, mt))
+    print("run %s: %s in %d files -> %d chunk(s), chunk size %s"
+          % (run_id[:8], human(total), len(files), len(chunks), human(chunk_bytes)))
+    if ctx.dry:
+        for seq, chunk in enumerate(chunks, 1):
+            print("[dry-run] chunk %d/%d: %s in %d files"
+                  % (seq, len(chunks), human(sum(s for _, s, _ in chunk)), len(chunk)))
+        print("[dry-run] would lock/unlock per chunk and write %d index blocks"
+              % len(chunks))
+        return
+    db_init(ctx)
+    c = db_open(ctx)
+    c.execute("INSERT OR REPLACE INTO runs VALUES(?,?,?,?,?,?,?)",
+              (run_id, time.strftime("%Y-%m-%d %H:%M:%S"), None,
+               " ".join(args), chunk_bytes, len(chunks), 0))
+    c.commit()
+    c.close()
+    for seq, chunk in enumerate(chunks, 1):
+        if seq > 1 and cooldown:
+            print("cooldown %ds before chunk %d ..." % (cooldown, seq), flush=True)
+            time.sleep(cooldown)
+        write_chunk(ctx, run_id, seq, len(chunks), chunk, chunk_bytes, force)
+    c = db_open(ctx)
+    c.execute("UPDATE runs SET finished=?, status=1 WHERE run_id=?",
+              (time.strftime("%Y-%m-%d %H:%M:%S"), run_id))
+    c.commit()
+    c.close()
+    print("run %s complete: %d chunk(s)" % (run_id[:8], len(chunks)))
+
+
+def cmd_resume(ctx, args):
+    force = "--force" in sys.argv
+    args = [a for a in args if a not in ("--force",)]
+    cooldown = 0
+    if "--cooldown" in args:
+        i = args.index("--cooldown")
+        cooldown = int(args[i + 1])
+        del args[i:i + 2]
+    if "--rate" in args:
+        i = args.index("--rate")
+        ctx.rate = int(float(args[i + 1]) * 1024 * 1024)
+        del args[i:i + 2]
+    if not args:
+        die("usage: resume RUN_ID [--force] [--rate MBps] [--cooldown SEC]")
+    rid = args[0]
+    c = db_open(ctx)
+    row = c.execute("SELECT run_id,chunk_bytes,n_chunks,status FROM runs WHERE run_id LIKE ?",
+                    (rid + "%",)).fetchone()
+    if not row:
+        c.close()
+        die("no such run: %s" % rid)
+    run_id, chunk_bytes, n_chunks, status = row
+    if status == 1:
+        c.close()
+        print("run %s already complete" % run_id[:8])
+        return
+    done = {r[0] for r in c.execute(
+        "SELECT chunk_seq FROM sessions WHERE run_id=? AND status=1", (run_id,))}
+    c.close()
+    plan_file = os.path.join(ctx.dir, "runs", run_id, "plan.tsv")
+    if not os.path.exists(plan_file):
+        die("missing plan: %s" % plan_file)
+    chunks = {}
+    for line in open(plan_file):
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        seq, fp, sz = parts[0], parts[1], parts[2]
+        mt = int(parts[3]) if len(parts) > 3 else None
+        chunks.setdefault(int(seq), []).append((unesc(fp), int(sz), mt))
+    for seq in sorted(chunks):
+        if seq in done:
+            print("[chunk %d/%d] already complete, skipping" % (seq, n_chunks))
+            continue
+        if cooldown:
+            print("cooldown %ds before chunk %d ..." % (cooldown, seq), flush=True)
+            time.sleep(cooldown)
+        write_chunk(ctx, run_id, seq, n_chunks, chunks[seq], chunk_bytes, force)
+    c = db_open(ctx)
+    c.execute("UPDATE runs SET finished=?, status=1 WHERE run_id=?",
+              (time.strftime("%Y-%m-%d %H:%M:%S"), run_id))
+    c.commit()
+    c.close()
+    print("run %s complete" % run_id[:8])
+
+
+def cmd_runs(ctx, args):
+    c = db_open(ctx)
+    rows = c.execute("SELECT run_id,started,finished,status,chunk_bytes,n_chunks,source"
+                     " FROM runs ORDER BY started").fetchall()
+    c.close()
+    if not rows:
+        print("(no runs)")
+        return
+    print("%-9s %-19s %-5s %-6s %s" % ("run", "started", "stat", "chunks", "source"))
+    for rid, st, fin, status, cb, n, src in rows:
+        print("%-9s %-19s %-5s %-6s %s" % (rid[:8], st, status, n, src))
+
+
+def gen_switch_script(ctx, path, state_file, mode):
+    """Generate the tar -F volume-switch helper."""
+    selfcmd = "python3 %s _peek" % shlex.quote(SELF)
+    if ctx.rhost:
+        off = " ".join(shlex.quote(x) for x in
+                       ctx.ssh_argv() + ["sudo mt -f %s offline" % shlex.quote(ctx.rdev)])
+    else:
+        off = "sudo mt -f %s offline" % shlex.quote(ctx.dev)
+    lines = ["#!/bin/bash", "set -u"]
+    if mode == "write":
+        lines += [
+            "%s >/dev/null 2>&1 || true" % off,
+            "printf '\\n>>> Tape full. Insert the NEXT (blank) tape, then press ENTER: ' >/dev/tty",
+            "read -r _ </dev/tty || exit 1",
+            "line=$(%s 2>/dev/null | tail -1)" % selfcmd,
+            "cid=$(printf '%%s' \"$line\" | cut -f1); bc=$(printf '%%s' \"$line\" | cut -f2)",
+            "[ -n \"$cid\" ] || cid=UNKNOWN",
+            "printf '%%s\\t%%s\\t1\\n' \"$cid\" \"$bc\" >> %s" % shlex.quote(state_file),
+            "printf '>>> recorded tape: %%s\\n' \"$cid\" >/dev/tty",
+            "exit 0",
+        ]
+    else:
+        lbl = state_file + ".lbl"
+        lines += [
+            "%s >/dev/null 2>&1 || true" % off,
+            "line=$(head -1 %s 2>/dev/null)" % shlex.quote(lbl),
+            "[ -n \"$line\" ] || line='<next tape>'",
+            "printf '\\n>>> Insert tape [%%s], then press ENTER: ' \"$line\" >/dev/tty",
+            "read -r _ </dev/tty || exit 1",
+            "sed -i '1d' %s 2>/dev/null || true" % shlex.quote(lbl),
+            "exit 0",
+        ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o755)
+
+
+# ---------------------------------------------------------------- read paths
+
+
+def cmd_find(ctx, args):
+    show_all = any(a in ("--all", "-a") for a in args)
+    args = [a for a in args if a not in ("--all", "-a")]
+    if not args:
+        die("usage: find [--all] PATTERN")
+    c = db_open(ctx)
+    pat = "%" + args[0] + "%"
+    base = """
+      SELECT f.path, f.size, f.mtime, s.started, s.host_name, st.tape, st.file_no, s.sid,
+             COUNT(*) OVER (PARTITION BY s.host_name, f.path) AS vcount,
+             ROW_NUMBER() OVER (PARTITION BY s.host_name, f.path
+                                ORDER BY s.started DESC, s.sid DESC) AS rn
+      FROM file_index f JOIN sessions s ON s.sid=f.sid
+      LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1
+      WHERE f.path LIKE ?
+    """
+    q = ("SELECT * FROM (%s) ORDER BY path, started DESC LIMIT 500" % base) if show_all \
+        else ("SELECT * FROM (%s) WHERE rn=1 ORDER BY path LIMIT 500" % base)
+    rows = c.execute(q, (pat,)).fetchall()
+    c.close()
+    if not rows:
+        print("(no match)")
+        return
+    print("%-10s %-19s %-10s %-4s %-24s %s" % ("host", "backup time", "size", "ver", "tape", "path"))
+    for path, size, mt, started, host, tape, fno, sid, vc, rn in rows:
+        mts = time.strftime("%Y-%m-%d", time.localtime(mt)) if mt else "-"
+        print("%-10s %-19s %-10s %-4s %-24s %s  (mtime %s)" % (
+            host, started, human(size), "x%d" % vc if vc > 1 else "",
+            tape or "-", path, mts))
+
+
+def cmd_extract(ctx, args):
+    dest = None
+    sid = None
+    runid = None
+    at = None
+    paths = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-C":
+            dest = args[i + 1]
+            i += 2
+        elif a == "--sid":
+            sid = args[i + 1]
+            i += 2
+        elif a == "--run":
+            runid = args[i + 1]
+            i += 2
+        elif a == "--at":
+            at = args[i + 1]
+            i += 2
+        else:
+            paths.append(a)
+            i += 1
+    if not dest or not os.path.isdir(dest):
+        die("usage: extract -C DESTDIR [--sid N | PATH...]")
+    c = db_open(ctx)
+    if runid:
+        rows = c.execute(
+            "SELECT s.sid, st.tape, st.file_no FROM sessions s"
+            " JOIN session_tapes st ON st.sid=s.sid AND st.seq=1"
+            " WHERE s.run_id LIKE ? ORDER BY s.chunk_seq", (runid + "%",)).fetchall()
+        c.close()
+        if not rows:
+            die("no sessions for run %s" % runid)
+        cur = None
+        for sid_r, tape, fno in rows:
+            if tape != cur:
+                if cur is not None:
+                    ctx.mt_try("offline")
+                    print("insert tape %s, press ENTER: " % tape, end="", flush=True)
+                    sys.stdin.readline()
+                cur = tape
+            ctx.ensure_ready()
+            pos_file(ctx, fno)
+            if ctx.rhost:
+                r1, r2 = ctx.stream_read(dest)
+                if r2 not in (0, 1):
+                    die("tar extract failed (%d) for session %s" % (r2, sid_r[:8]))
+            else:
+                r = ctx.tar(["-x", "-C", dest], check=False)
+                if r.returncode not in (0, 1):
+                    die("tar extract failed (%d)" % r.returncode)
+        print("extracted run %s into %s" % (runid[:8], dest))
+        return
+    if sid:
+        row = c.execute("SELECT sid FROM sessions WHERE sid LIKE ?", (sid + "%",)).fetchone()
+        if not row:
+            die("no session matching %s" % sid)
+        sid = row[0]
+    else:
+        if not paths:
+            die("give --sid N or PATHs")
+        sids = set()
+        for p in paths:
+            pp = p.lstrip("/")
+            if at:
+                row = c.execute(
+                    "SELECT s.sid, s.started, count(*) FROM file_index f"
+                    " JOIN sessions s ON s.sid=f.sid WHERE f.path=? AND s.started<=?"
+                    " GROUP BY s.sid ORDER BY s.started DESC LIMIT 1", (pp, at)).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT s.sid, s.started, count(*) FROM file_index f"
+                    " JOIN sessions s ON s.sid=f.sid WHERE f.path=?"
+                    " GROUP BY s.sid ORDER BY s.started DESC LIMIT 1", (pp,)).fetchone()
+            if not row:
+                die("path not in index%s: %s" % ((" at/ before " + at) if at else "", p))
+            nver = c.execute("SELECT count(DISTINCT sid) FROM file_index WHERE path=?",
+                             (pp,)).fetchone()[0]
+            if nver > 1 and not at:
+                print("note: %d versions of %s; using latest (%s). Use --sid/--at for another."
+                      % (nver, p, row[1]))
+            sids.add(row[0])
+        if len(sids) > 1:
+            die("the given paths belong to different sessions; extract them separately or use --sid")
+        sid = sids.pop()
+    tapes = c.execute("SELECT seq,tape,file_no FROM session_tapes WHERE sid=? ORDER BY seq",
+                      (sid,)).fetchall()
+    c.close()
+    if not tapes:
+        die("session has no tape records")
+    first_file = tapes[0][2]
+    ctx.ensure_ready()
+    if ctx.dry:
+        print("[dry-run] would seek to file %d of tape %s and tar -x %d file(s)"
+              % (first_file, tapes[0][1], len(tapes)))
+        return
+    ctx.lock()
+    try:
+        pos_file(ctx, first_file)
+        base_argv, _ = ctx.tar_argv()
+        if ctx.rhost and len(tapes) == 1:
+            r1, r2 = ctx.stream_read(dest, paths)
+            if r2 not in (0, 1):
+                die("tar extract failed (%d)" % r2)
+        elif len(tapes) == 1:
+            cmd = base_argv + ["-b%d" % BS, "-C", dest, "-x"] + paths
+            r = run(cmd, check=False)
+            if r.returncode not in (0, 1):
+                die("tar extract failed (%d)" % r.returncode)
+        else:
+            tmp = tempfile.mkdtemp(prefix="tbrd.")
+            lbl = os.path.join(tmp, "labels.txt")
+            with open(lbl, "w") as f:
+                for _, tape, _ in tapes[1:]:
+                    f.write("%s\n" % tape)
+            sw = os.path.join(tmp, "switch.sh")
+            gen_switch_script(ctx, sw, os.path.join(tmp, "unused"), "read")
+            os.rename(lbl, os.path.join(tmp, "unused.lbl"))
+            cmd = base_argv + ["-b%d" % BS, "-M", "-F", sw, "-C", dest, "-x"] + paths
+            r = run(cmd, check=False)
+            subprocess.run(["rm", "-rf", tmp])
+            if r.returncode not in (0, 1):
+                die("tar extract failed (%d)" % r.returncode)
+    finally:
+        ctx.unlock()
+    print("extracted into %s" % dest)
+
+
+def cmd_check(ctx, args):
+    ctx.lock()
+    try:
+        return _check(ctx, args)
+    finally:
+        ctx.unlock()
+
+
+def _check(ctx, args):
+    db_open(ctx).close()
+    c = db_open(ctx)
+    if args:
+        rows = c.execute("SELECT s.sid,st.tape,st.file_no FROM session_tapes st"
+                         " JOIN sessions s ON s.sid=st.sid WHERE st.tape=? ORDER BY s.started",
+                         (args[0],)).fetchall()
+        if not rows:
+            die("no sessions recorded for tape %s" % args[0])
+    else:
+        rows = c.execute("SELECT s.sid,st.tape,st.file_no FROM session_tapes st"
+                         " JOIN sessions s ON s.sid=st.sid ORDER BY s.started").fetchall()
+    c.close()
+    cur = None
+    bad = 0
+    for sid, tape, fno in rows:
+        if tape != cur:
+            if cur is not None and not ctx.dry:
+                ctx.mt_try("offline")
+            print("tape %s — insert and press ENTER" % tape)
+            if not ctx.dry:
+                sys.stdin.readline()
+                ctx.ensure_ready()
+            cur = tape
+        pos_file(ctx, fno)
+        r = ctx.tar(["-t"], check=False)
+        if r.returncode in (0, 1):
+            print("  %s file %d: OK" % (sid[:8], fno))
+        else:
+            print("  %s file %d: READ ERROR" % (sid[:8], fno))
+            bad += 1
+    sys.exit(1 if bad else 0)
+
+
+def cmd_erase(ctx, args):
+    yes = any(a in ("-y", "--yes") for a in args)
+    force = "--force" in args
+    long = "--long" in args
+    db_open(ctx).close()
+    ctx.lock()
+    tick("lock acquired")
+    try:
+        ctx.ensure_ready()
+        try:
+            mam = tape_id(ctx)
+        except RuntimeError as e:
+            die("cannot identify tape: %s" % e)
+        cid = mam.get("canonical_id") or ""
+        if not cid:
+            die("tape has no MAM identity")
+        bc = mam.get("barcode", "")
+        # merge the tape's own index blocks first, so sessions written by other
+        # hosts are discovered and reported too
+        try:
+            if read_sig(ctx, 1).startswith(b"TAPEHDR/"):
+                print("scanning existing index blocks ...")
+                scan_tape(ctx)
+        except SystemExit:
+            pass
+        c = db_open(ctx)
+        sids = [r[0] for r in c.execute(
+            "SELECT DISTINCT sid FROM session_tapes WHERE tape=?", (cid,))]
+        info, spanning = [], []
+        for sid in sids:
+            row = c.execute("SELECT started,paths,est_size FROM sessions WHERE sid=?",
+                            (sid,)).fetchone()
+            tapes = [r[0] for r in c.execute(
+                "SELECT DISTINCT tape FROM session_tapes WHERE sid=?", (sid,))]
+            if len(tapes) > 1:
+                spanning.append((sid, tapes))
+            info.append((sid, row, tapes))
+        print(fmt_mam(mam))
+        print("%-22s %s (%s)" % ("tape to erase", cid, bc or "-"))
+        if info:
+            print("sessions that will be removed from the index:")
+            for sid, row, tapes in info:
+                started = row[0] if row else "?"
+                size = human((row[2] or 0)) if row else "?"
+                print("  %s  %s  %s  paths=%s" % (sid[:8], started, size,
+                                                  row[1] if row else "?"))
+        else:
+            print("(no sessions recorded on this tape)")
+        if spanning and not force:
+            die("some sessions span other tapes and would become unrestorable — "
+                "rerun with --force if you accept losing them")
+        if not yes:
+            print("This ERASES the tape and deletes %d session(s) from the index."
+                  % len(info))
+            sys.stdout.write("Type YES to continue: ")
+            sys.stdout.flush()
+            if sys.stdin.readline().strip() != "YES":
+                die("aborted")
+        print("erasing tape (%s) ..." % ("long/full" if long else "quick"))
+        ctx.mt_try("rewind")   # short erase starts at the current position
+        t0 = time.time()
+        ctx.sg_erase(long=long)
+        time.sleep(2)
+        mam2 = tape_id(ctx)
+        rem = mam2.get("remaining_mb")
+        mx = mam2.get("max_mb")
+        print("erase done in %.0fs; capacity %s of %s"
+              % (time.time() - t0, human((rem or 0) * 1024 * 1024),
+                 human((mx or 0) * 1024 * 1024)))
+        for sid, _, _ in info:
+            c.execute("DELETE FROM file_index WHERE sid=?", (sid,))
+            c.execute("DELETE FROM session_tapes WHERE sid=?", (sid,))
+            c.execute("DELETE FROM sessions WHERE sid=?", (sid,))
+        c.execute("DELETE FROM tapes WHERE cid=?", (cid,))
+        c.execute("DELETE FROM runs WHERE run_id NOT IN "
+                  "(SELECT DISTINCT run_id FROM sessions WHERE run_id IS NOT NULL)")
+        c.commit()
+        c.close()
+        print("removed %d session(s)/tape row %s (orphan runs cleaned)" % (len(info), cid))
+        print("NOTE: other hosts' indexes are not updated; run on each of them:")
+        print("      tapebackup forget --tape %s" % cid)
+        ctx.mt_try("rewind")
+    finally:
+        ctx.unlock()
+
+
+def cmd_forget(ctx, args):
+    force = "--force" in args
+    args = [a for a in args if a != "--force"]
+    if len(args) < 2 or args[0] != "--tape":
+        die("usage: forget --tape CANONICAL_ID [--force]")
+    cid = args[1]
+    c = db_open(ctx)
+    sids = [r[0] for r in c.execute(
+        "SELECT DISTINCT sid FROM session_tapes WHERE tape=?", (cid,))]
+    if not sids:
+        print("no sessions recorded for tape %s" % cid)
+        c.close()
+        return
+    spanned = []
+    for sid in sids:
+        tapes = [r[0] for r in c.execute(
+            "SELECT DISTINCT tape FROM session_tapes WHERE sid=?", (sid,))]
+        if len(tapes) > 1:
+            spanned.append((sid, tapes))
+    if spanned and not force:
+        for sid, tapes in spanned:
+            print("session %s also uses: %s" % (sid[:8], ", ".join(tapes)), file=sys.stderr)
+        die("some sessions span other tapes; rerun with --force to forget them anyway")
+    for sid in sids:
+        c.execute("DELETE FROM file_index WHERE sid=?", (sid,))
+        c.execute("DELETE FROM session_tapes WHERE sid=?", (sid,))
+        c.execute("DELETE FROM sessions WHERE sid=?", (sid,))
+    c.execute("DELETE FROM tapes WHERE cid=?", (cid,))
+    c.execute("DELETE FROM runs WHERE run_id NOT IN "
+              "(SELECT DISTINCT run_id FROM sessions WHERE run_id IS NOT NULL)")
+    c.commit()
+    c.close()
+    print("forgot %d session(s) and tape %s from this host's index" % (len(sids), cid))
+
+
+def cmd_scan(ctx, args):
+    ctx.lock()
+    try:
+        return _scan(ctx, args)
+    finally:
+        ctx.unlock()
+
+
+def _scan(ctx, args):
+    ctx.ensure_ready()
+    try:
+        mam = tape_id(ctx)
+    except RuntimeError as e:
+        die(str(e))
+    cid = (mam or {}).get("canonical_id", "")
+    try:
+        if read_sig(ctx, 1).startswith(b"TAPEHDR/"):
+            print("%-22s %s" % ("format", "tapebackup v2"))
+    except SystemExit:
+        pass
+    print(fmt_mam(mam) if mam else "(no MAM data)")
+    prev = None
+    c = db_open(ctx)
+    if cid:
+        c.execute("INSERT OR IGNORE INTO tapes(cid,barcode,created,created_by) VALUES(?,?,?,?)",
+                  (cid, (mam or {}).get("barcode", ""),
+                   time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "%s (%s)" % (ctx.host_name, ctx.host_uuid)))
+        c.commit()
+    c.close()
+    print("scanning tape ...")
+    inv = inventory(ctx)
+    print("files found: %d" % len(inv))
+    tmp = tempfile.mkdtemp(prefix="tbscan.")
+    merged = 0
+    try:
+        for n, kind, blk in inv:
+            if kind != "idx":
+                continue
+            pos_file(ctx, n)
+            name = "TAPEIDX.%d" % blk
+            ctx.tar(["-x", "-C", tmp, name])
+            block_merge(ctx, os.path.join(tmp, name))
+            merged += 1
+    finally:
+        subprocess.run(["rm", "-rf", tmp])
+    print("index blocks merged: %d" % merged)
+    if not merged:
+        print("no tapebackup index blocks on this tape (foreign/mid-span tape)")
+
+
+def cmd_monitor(ctx, args):
+    interval = 15
+    logf = None
+    once = False
+    if "--interval" in args:
+        i = args.index("--interval")
+        interval = int(args[i + 1])
+    if "--log" in args:
+        i = args.index("--log")
+        logf = args[i + 1]
+    if "--once" in args:
+        once = True
+    fh = open(logf, "a") if logf else None
+
+    def emit(line):
+        print(line, flush=True)
+        if fh:
+            fh.write(line + "\n")
+            fh.flush()
+
+    emit("# time                      temp humidity voltage  last_temp_event_h  max_mech_temp_exceeded")
+    try:
+        while True:
+            st = drive_env_status(ctx)
+            t = st.get("Drive temperature", "?")
+            h = st.get("Drive humidity", "?")
+            v = st.get("Drive voltage", "?")
+            lt = st.get("Lifetime power on hours when last temperature condition occurred", "?")
+            mx = st.get("Maximum recommended mechanism temperature exceeded", "?")
+            line = "%-26s %-4s %-8s %-8s %-18s %s" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), t, h, v, lt, mx)
+            if t == "1":
+                line += "   << OVERHEAT ALERT (TapeAlert 29) >>"
+            elif h == "1":
+                line += "   << HUMIDITY ALERT >>"
+            emit(line)
+            if once:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if fh:
+            fh.close()
+
+
+def cmd_versions(ctx, args):
+    if not args:
+        die("usage: versions PATH")
+    p = args[0].lstrip("/")
+    c = db_open(ctx)
+    rows = c.execute(
+        "SELECT s.host_name, s.started, f.size, f.mtime, st.tape, st.file_no, s.sid"
+        " FROM file_index f JOIN sessions s ON s.sid=f.sid"
+        " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1"
+        " WHERE f.path=? ORDER BY s.started DESC", (p,)).fetchall()
+    c.close()
+    if not rows:
+        print("(no versions for %s)" % p)
+        return
+    print("%-10s %-19s %-10s %-19s %-24s %s" % (
+        "host", "backup time", "size", "file mtime", "tape", "sid"))
+    for host, started, size, mt, tape, fno, sid in rows:
+        mts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mt)) if mt else "-"
+        print("%-10s %-19s %-10s %-19s %-24s %s" % (
+            host, started, human(size), mts, tape or "-", sid[:8]))
+
+
+def cmd_ls(ctx, args):
+    """Browse the index: ls [-R] [HOST:]PATH  (deduplicated: latest version wins)"""
+    recursive = any(a in ("-R", "--recursive") for a in args)
+    args = [a for a in args if a not in ("-R", "--recursive")]
+    target = args[0] if args else None
+    host = None
+    path = ""
+    if target:
+        if ":" in target:
+            host, path = target.split(":", 1)
+        else:
+            path = target
+        path = path.lstrip("/").rstrip("/")
+    c = db_open(ctx)
+    base = ("SELECT s.host_name, f.path, f.size, f.mtime, s.started, st.tape, st.file_no"
+            " FROM file_index f JOIN sessions s ON s.sid=f.sid"
+            " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1")
+    wh, params = [], []
+    if host:
+        wh.append("s.host_name = ?")
+        params.append(host)
+    if path:
+        wh.append("(f.path = ? OR f.path LIKE ?)")
+        params += [path, path + "/%"]
+    rows = c.execute(base + ((" WHERE " + " AND ".join(wh)) if wh else ""), params).fetchall()
+    c.close()
+
+    # dedupe: same (host,path) keeps the latest session; remember version count
+    ded = {}
+    for h, p, sz, mt, started, tape, fno in rows:
+        k = (h, p)
+        d = ded.get(k)
+        if d is None:
+            ded[k] = {"size": sz, "mtime": mt, "started": started,
+                      "tape": tape, "fno": fno, "n": 1}
+        else:
+            d["n"] += 1
+            if started > d["started"]:
+                d.update(size=sz, mtime=mt, started=started, tape=tape, fno=fno)
+
+    if not target:
+        agg = {}
+        for (h, p), d in ded.items():
+            top = p.split("/", 1)[0]
+            a = agg.setdefault((h, top), [0, 0])
+            a[0] += 1
+            a[1] += d["size"] or 0
+        cur = None
+        for (h, top), (n, sz) in sorted(agg.items()):
+            if h != cur:
+                print("%s:" % h)
+                cur = h
+            print("  d  %-40s %6d files  %10s" % (top + "/", n, human(sz)))
+        return
+
+    if path and not ded:
+        print("(nothing under %s)" % (target,))
+        return
+
+    if recursive:
+        print("%-10s %-19s %-10s %10s %-24s %s" % (
+            "host", "backup time", "size", "mtime", "tape", "path"))
+        for (h, p), d in sorted(ded.items()):
+            if p == path:
+                mts = time.strftime("%Y-%m-%d %H:%M", time.localtime(d["mtime"])) if d["mtime"] else "-"
+                print("%-10s %-19s %-10s %10s %-24s %s" % (
+                    h, d["started"], human(d["size"]), mts, d["tape"] or "-", p))
+                continue
+            mts = time.strftime("%Y-%m-%d", time.localtime(d["mtime"])) if d["mtime"] else "-"
+            mark = "  x%d" % d["n"] if d["n"] > 1 else ""
+            print("%-10s %-19s %-10s %10s %-24s %s%s" % (
+                h, d["started"], human(d["size"]), mts, d["tape"] or "-", p, mark))
+        return
+
+    prefix = (path + "/") if path else ""
+    agg = {}
+    exact = []
+    for (h, p), d in ded.items():
+        if p == path:
+            exact.append((h, p, d))
+            continue
+        rel = p[len(prefix):] if p.startswith(prefix) else None
+        if not rel:
+            continue
+        first, sep, _ = rel.partition("/")
+        key = (h, first)
+        a = agg.setdefault(key, {"n": 0, "sz": 0, "isfile": True, "ver": 0})
+        a["n"] += 1
+        a["sz"] += d["size"] or 0
+        a["ver"] = max(a["ver"], d["n"])
+        if sep:
+            a["isfile"] = False
+    cur = None
+    for (h, name), a in sorted(agg.items()):
+        if h != cur:
+            print("%s:" % h)
+            cur = h
+        mark = "  x%d" % a["ver"] if a["ver"] > 1 else ""
+        if a["isfile"]:
+            print("  f  %-44s %10s%s" % (name, human(a["sz"]), mark))
+        else:
+            print("  d  %-44s %10s  (%d files)%s" % (
+                name + "/", human(a["sz"]), a["n"], mark))
+    for h, p, d in exact:
+        mark = "  x%d" % d["n"] if d["n"] > 1 else ""
+        print("%-10s %-10s %-24s %s%s" % (h, human(d["size"]), d["tape"] or "-", p, mark))
+
+
+def cmd_tapes(ctx, args):
+    c = db_open(ctx)
+    rows = c.execute(
+        "SELECT t.cid,t.barcode,count(DISTINCT st.sid),count(DISTINCT st.tape),"
+        " coalesce(sum(DISTINCT s.est_size),0)"
+        " FROM tapes t LEFT JOIN session_tapes st ON st.tape=t.cid"
+        " LEFT JOIN sessions s ON s.sid=st.sid GROUP BY t.cid ORDER BY t.created").fetchall()
+    c.close()
+    if not rows:
+        print("(no tapes)")
+        return
+    print("%-24s %-14s %-8s %s" % ("canonical id", "barcode", "sessions", "approx size"))
+    for cid, bc, ns, nt, sz in rows:
+        print("%-24s %-14s %-8d %s" % (cid, bc or "-", ns, human(sz)))
+
+
+def cmd_sessions(ctx, args):
+    c = db_open(ctx)
+    rows = c.execute("SELECT sid,started,status,est_size,est_files,paths"
+                     " FROM sessions ORDER BY started").fetchall()
+    c.close()
+    if not rows:
+        print("(no sessions)")
+        return
+    print("%-9s %-19s %-5s %10s %6s  %s" % ("sid", "started", "stat", "size", "files", "paths"))
+    for sid, st, status, sz, nf, p in rows:
+        print("%-9s %-19s %-5s %10s %6s  %s" % (sid[:8], st, status, human(sz), nf, p))
+
+
+def cmd_peek(ctx, args):
+    """Used by the volume-switch script: print cid<TAB>barcode for loaded tape."""
+    try:
+        mam = tape_id(ctx)
+    except Exception:
+        print("UNKNOWN\t")
+        return
+    print("%s\t%s" % (mam.get("canonical_id", "UNKNOWN"), mam.get("barcode", "")))
+
+
+def _ready_cmd(argv):
+    dev = argv[1] if len(argv) > 1 else "/dev/nst0"
+    try:
+        ok, msg = drive_wait_ready(dev)
+    except Exception as e:
+        print(json.dumps({"ready": False, "error": str(e)}))
+        sys.exit(2)
+    print(json.dumps({"ready": ok, "msg": msg}))
+    sys.exit(0 if ok else 2)
+
+
+def _erase_cmd(argv):
+    dev = argv[1] if len(argv) > 1 else "/dev/nst0"
+    long = len(argv) > 2 and argv[2] == "long"
+    try:
+        ok, sense = sg_erase_dev(dev, long)
+    except Exception as e:
+        print(json.dumps({"erased": False, "error": str(e)}))
+        sys.exit(2)
+    print(json.dumps({"erased": ok, "sense": sense.hex()}))
+    sys.exit(0 if ok else 2)
+
+
+def _load_cmd(argv):
+    dev = argv[1] if len(argv) > 1 else "/dev/nst0"
+    try:
+        sg = sg_name_for_st(dev)
+        fd = os.open(sg, os.O_RDWR)
+        try:
+            sg_issue(fd, bytes([0x1B, 0, 0, 0, 1, 0]), 0, SG_DXFER_NONE)
+        finally:
+            os.close(fd)
+        print(json.dumps({"loaded": True}))
+    except Exception as e:
+        print(json.dumps({"loaded": False, "error": str(e)}))
+        sys.exit(2)
+
+
+def _mam_cmd(argv):
+    dev = argv[1] if len(argv) > 1 else "/dev/nst0"
+    try:
+        print(json.dumps(mam_snapshot(dev)))
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------- main
+
+
+def usage():
+    print(__doc__ or "")
+    print("""
+Commands:
+  init                        create index DB
+  set-host NAME               set human-readable host name (default: hostname)
+  inspect                     show tape MAM identity + content state
+  write [--force] [--chunk-size 50G] [--rate MBps] [--cooldown SEC] SRC...
+                              chunked backup (per-chunk index + lock)
+  find [--all] PATTERN        search index (latest per path; --all = every version)
+  versions PATH               list all backup versions of one path
+  extract -C DIR [--sid N | --at DATE | --run R | PATH...]
+                              restore one chunk, a whole run, or exact paths
+  check [TAPE]                read-verify recorded archives
+  resume RUN_ID [--force] [--rate MBps] [--cooldown SEC]
+                              continue an interrupted chunked run
+  runs                        list runs (chunked backup sets)
+  erase [-y] [--force] [--long]   ERASE tape and delete its sessions from index
+  forget --tape CID [--force]     remove a tape's sessions from THIS index only
+  scan                        read tape's index blocks into local DB
+  monitor [--interval N] [--log FILE] [--once]
+                              watch drive temperature/humidity TapeAlert flags
+  ls [-R] [HOST:]PATH         browse index (deduped: latest version)
+  tapes                       list tapes
+  sessions                    list sessions
+Global flag:
+  -n, --dry-run               print plan, touch nothing
+""")
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "_mam":
+        _mam_cmd(argv)
+        return
+    if argv and argv[0] == "_ready":
+        _ready_cmd(argv)
+        return
+    if argv and argv[0] == "_load":
+        _load_cmd(argv)
+        return
+    if argv and argv[0] == "_erase":
+        _erase_cmd(argv)
+        return
+    dry = False
+    if argv and argv[0] in ("-n", "--dry-run"):
+        dry = True
+        argv = argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage()
+        return
+    cmd, args = argv[0], argv[1:]
+    ctx = Ctx(dry=dry)
+    try:
+        if cmd == "init":
+            cmd_init(ctx, args)
+        elif cmd == "set-host":
+            cmd_set_host(ctx, args)
+        elif cmd == "inspect":
+            cmd_inspect(ctx, args)
+        elif cmd == "write":
+            cmd_write(ctx, args)
+        elif cmd == "find":
+            cmd_find(ctx, args)
+        elif cmd == "extract":
+            cmd_extract(ctx, args)
+        elif cmd == "check":
+            cmd_check(ctx, args)
+        elif cmd == "resume":
+            cmd_resume(ctx, args)
+        elif cmd == "runs":
+            cmd_runs(ctx, args)
+        elif cmd == "erase":
+            cmd_erase(ctx, args)
+        elif cmd == "forget":
+            cmd_forget(ctx, args)
+        elif cmd == "scan":
+            cmd_scan(ctx, args)
+        elif cmd == "ls":
+            cmd_ls(ctx, args)
+        elif cmd == "versions":
+            cmd_versions(ctx, args)
+        elif cmd == "monitor":
+            cmd_monitor(ctx, args)
+        elif cmd == "temp":
+            cmd_monitor(ctx, args + ["--once"])
+        elif cmd == "tapes":
+            cmd_tapes(ctx, args)
+        elif cmd == "sessions":
+            cmd_sessions(ctx, args)
+        elif cmd == "_peek":
+            cmd_peek(ctx, args)
+        else:
+            die("unknown command: %s (see help)" % cmd)
+    finally:
+        try:
+            ctx.unlock()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)

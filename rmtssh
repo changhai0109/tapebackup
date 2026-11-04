@@ -1,0 +1,2 @@
+#!/bin/sh
+exec ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -c aes128-gcm@openssh.com -o ControlMaster=auto -o ControlPath=/tmp/tapebackup-ssh-%r@%h:%p -o ControlPersist=600 -p 32824 -l changhai -i /home/changhai/.ssh/id_ed25519 -o IdentitiesOnly=yes "$@"
