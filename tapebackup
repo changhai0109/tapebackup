@@ -2096,49 +2096,84 @@ def _sha256_file(path, bufsize=1 << 20):
     return h.hexdigest()
 
 
-def _verify_from_tape(ctx, cands):
-    """Read the chunk(s) holding the candidates back from tape and compare
-    the file contents byte for byte (sha256).  cands are dicts with
-    fp/rel/sid/tape/file_no/size.  Returns {fp: bool}."""
-    res = {}
-    groups = {}
-    for it in cands:
-        groups.setdefault((it["sid"], it["tape"], it["file_no"]), []).append(it)
-    for (sid, tape, fno), items in groups.items():
+def _load_tape(ctx, tape):
+    """Make sure the wanted tape is loaded, prompting the user if needed."""
+    for _ in range(3):
         ctx.ensure_ready()
         cur = (tape_id(ctx).get("canonical_id") or "")
-        if cur != tape:
-            if not sys.stdin.isatty():
-                print("VERIFY SKIP: tape %s not loaded (current: %s)"
-                      % (tape, cur or "?"))
-                for it in items:
-                    res[it["fp"]] = False
-                continue
-            ctx.mt_try("offline")
-            print("insert tape %s, press ENTER: " % tape, end="", flush=True)
-            sys.stdin.readline()
-            ctx.ensure_ready()
-            cur = (tape_id(ctx).get("canonical_id") or "")
-            if cur != tape:
-                print("VERIFY SKIP: wrong tape loaded (%s)" % (cur or "?"))
-                for it in items:
-                    res[it["fp"]] = False
-                continue
+        if cur == tape:
+            return True
+        print("VERIFY: drive contains %s, need %s"
+              % (cur or "(no tape)", tape), flush=True)
+        if not sys.stdin.isatty():
+            print("VERIFY SKIP: tape %s not loaded (current: %s)"
+                  % (tape, cur or "?"))
+            return False
+        ctx.mt_try("offline")
+        print(">>> insert tape %s, then press ENTER: " % tape,
+              end="", flush=True)
+        if not sys.stdin.readline():
+            return False
+    return False
+
+
+def _verify_from_tape(ctx, c, cands):
+    """Read the chunk(s) holding the candidates back from tape and compare
+    the file contents byte for byte (sha256).  Returns {fp: bool}."""
+    res = {}
+    by_sid = {}
+    for it in cands:
+        by_sid.setdefault(it["sid"], []).append(it)
+    if ctx.dry:
+        print("VERIFY SKIP: content verification is not possible with -n")
+        return res
+    for sid, items in by_sid.items():
         ctx.lock()
-        tmp = tempfile.mkdtemp(prefix="tbver.")
+        tmp = None
         try:
-            pos_file(ctx, fno)
+            tapes = c.execute(
+                "SELECT seq,tape,file_no FROM session_tapes WHERE sid=?"
+                " ORDER BY seq", (sid,)).fetchall()
+            if not tapes:
+                print("VERIFY SKIP: session %s has no tape record" % sid[:8])
+                for it in items:
+                    res[it["fp"]] = False
+                continue
+            if not _load_tape(ctx, tapes[0][1]):
+                for it in items:
+                    res[it["fp"]] = False
+                continue
+            tmp = tempfile.mkdtemp(prefix="tbver.")
+            pos_file(ctx, tapes[0][2])
             paths = sorted({it["rel"] for it in items})
-            if ctx.rhost:
-                r1, r2 = ctx.stream_read(tmp, paths)
-                if r2 not in (0, 1):
-                    raise RuntimeError("tar extract failed (%d)" % r2)
+            if len(tapes) == 1:
+                if ctx.rhost:
+                    r1, r2 = ctx.stream_read(tmp, paths)
+                    if r2 not in (0, 1):
+                        raise RuntimeError("tar extract failed (%d)" % r2)
+                else:
+                    base_argv, _ = ctx.tar_argv()
+                    r = run(base_argv + ["-b%d" % BS, "-C", tmp, "-x"] + paths,
+                            check=False)
+                    if r.returncode not in (0, 1):
+                        raise RuntimeError("tar extract failed (%d)"
+                                           % r.returncode)
             else:
+                # session spans tapes: tar -M + switch script that prompts
+                labels = os.path.join(tmp, "labels.txt")
+                with open(labels, "w") as f:
+                    for _seq, t2, _fno in tapes[1:]:
+                        f.write("%s\n" % t2)
+                sw = os.path.join(tmp, "switch.sh")
+                gen_switch_script(ctx, sw, os.path.join(tmp, "unused"), "read")
+                os.rename(labels, os.path.join(tmp, "unused.lbl"))
                 base_argv, _ = ctx.tar_argv()
-                r = run(base_argv + ["-b%d" % BS, "-C", tmp, "-x"] + paths,
-                        check=False)
+                cmd = (base_argv + ["-b%d" % BS, "-M", "-F", sw, "-C", tmp,
+                                    "-x"] + paths)
+                r = run(cmd, check=False)
                 if r.returncode not in (0, 1):
-                    raise RuntimeError("tar extract failed (%d)" % r.returncode)
+                    raise RuntimeError("tar extract failed (%d)"
+                                       % r.returncode)
             for it in items:
                 sp = os.path.join(tmp, it["rel"])
                 try:
@@ -2153,7 +2188,8 @@ def _verify_from_tape(ctx, cands):
             for it in items:
                 res.setdefault(it["fp"], False)
         finally:
-            subprocess.run(["rm", "-rf", tmp])
+            if tmp:
+                subprocess.run(["rm", "-rf", tmp])
             ctx.unlock()
     return res
 
@@ -2165,8 +2201,9 @@ def cmd_remove(ctx, args):
     unchanged: the path must be indexed, its session committed, its size and
     mtime identical to the indexed copy, and the tape that holds it must still
     be present in the index (i.e. not erased).  With --verify-tape the file is
-    read back from tape and its content compared (sha256) before deleting.
-    Dry-run unless --yes is given.
+    read back from tape and its content compared (sha256) before deleting;
+    the user is asked to insert the right tape (and again for every further
+    tape if a session spans volumes).  Dry-run unless --yes is given.
     """
     yes = "--yes" in args or "-y" in args
     prune = "--prune-dirs" in args
@@ -2182,13 +2219,13 @@ def cmd_remove(ctx, args):
          " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1"
          " WHERE f.path=? AND s.host_name=? ORDER BY s.started DESC LIMIT 1")
     cands = []
-    skip = 0
+    skipped = []
     dirs = set()
     for target in args:
         ap = os.path.abspath(target)
         if os.path.islink(ap) or not os.path.exists(ap):
             print("SKIP (missing or symlink): %s" % target)
-            skip += 1
+            skipped.append((target, "missing or symlink"))
             continue
         if os.path.isdir(ap):
             files = []
@@ -2208,53 +2245,53 @@ def cmd_remove(ctx, args):
                 st = os.stat(fp)
             except OSError as e:
                 print("SKIP (stat failed: %s): %s" % (e, fp))
-                skip += 1
+                skipped.append((fp, "stat failed"))
                 continue
             row = c.execute(q, (rel, host)).fetchone()
             if not row:
                 print("SKIP (not in index): %s" % fp)
-                skip += 1
+                skipped.append((fp, "not in index"))
                 continue
             isize, imtime, status, tape, fno, sid = row
             if status != 1:
                 print("SKIP (session not committed): %s" % fp)
-                skip += 1
+                skipped.append((fp, "session not committed"))
                 continue
             if isize != st.st_size:
                 print("SKIP (size changed: index %s, disk %s): %s"
                       % (human(isize or 0), human(st.st_size), fp))
-                skip += 1
+                skipped.append((fp, "size changed"))
                 continue
             if imtime is None or int(imtime) != int(st.st_mtime):
                 print("SKIP (mtime changed: index %s, disk %s): %s"
                       % (imtime, int(st.st_mtime), fp))
-                skip += 1
+                skipped.append((fp, "mtime changed"))
                 continue
             if not tape or not c.execute(
                     "SELECT 1 FROM tapes WHERE cid=?", (tape,)).fetchone():
                 print("SKIP (tape %s not in index): %s" % (tape or "-", fp))
-                skip += 1
+                skipped.append((fp, "tape %s not in index" % (tape or "-")))
                 continue
             cands.append({"fp": fp, "rel": rel, "sid": sid, "tape": tape,
                           "file_no": fno, "size": st.st_size})
-    c.close()
     ver = {}
     if verify and cands:
-        ver = _verify_from_tape(ctx, cands)
+        ver = _verify_from_tape(ctx, c, cands)
+    c.close()
     ok = 0
     okbytes = 0
     for it in cands:
         fp = it["fp"]
         if verify and not ver.get(fp):
             print("VERIFY FAILED (tape copy differs or unavailable): %s" % fp)
-            skip += 1
+            skipped.append((fp, "tape verify failed"))
             continue
         if yes:
             try:
                 os.unlink(fp)
             except OSError as e:
                 print("ERROR (%s): %s" % (e, fp))
-                skip += 1
+                skipped.append((fp, "unlink failed: %s" % e))
                 continue
             print("DELETED %s  [%s]" % (fp, it["tape"]))
         else:
@@ -2272,8 +2309,13 @@ def cmd_remove(ctx, args):
     print("%s %d file(s), %s%s" % (
         "removed" if yes else "would remove", ok, human(okbytes),
         "" if yes else "  (dry run; add --yes to delete)"))
-    if skip:
-        print("skipped %d file(s)" % skip)
+    if skipped:
+        print("")
+        print("=" * 78)
+        print("SKIPPED FILES (kept): %d" % len(skipped))
+        print("=" * 78)
+        for fp, why in skipped:
+            print("  !!  %-80s  [%s]" % (fp, why))
 
 
 def cmd_tapes(ctx, args):
