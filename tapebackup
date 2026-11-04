@@ -314,6 +314,7 @@ class Ctx:
         self.rmt = os.environ.get("TAPEBACKUP_RMT", "/usr/sbin/rmt")
         self.dry = dry
         self.rate = 0
+        self.jobs = int(os.environ.get("TAPEBACKUP_JOBS", "1") or 1)
         self.host_uuid = self._machine_id()
         self.host_name = self._host_name()
         self._locks = []
@@ -1071,6 +1072,35 @@ def _resolve_input(target):
     if os.path.exists(cwd):
         return cwd
     return root
+
+
+_POOL = None
+_POOL_N = None
+
+
+def _pool_get(n):
+    global _POOL, _POOL_N
+    if _POOL is None or _POOL_N != n:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        # fork keeps __main__ (this single-file tool) available in workers
+        mpctx = multiprocessing.get_context("fork")
+        _POOL = ProcessPoolExecutor(max_workers=n, mp_context=mpctx)
+        _POOL_N = n
+    return _POOL
+
+
+def map_jobs(ctx, fn, items):
+    """Run fn(item) over items, using ctx.jobs worker processes when > 1.
+
+    The pool is created lazily and reused for the whole process lifetime, so
+    commands can share it.  With jobs == 1 (the default) this is a plain
+    serial loop."""
+    items = list(items)
+    n = getattr(ctx, "jobs", 1) or 1
+    if n <= 1 or len(items) < 2:
+        return [fn(x) for x in items]
+    return list(_pool_get(n).map(fn, items))
 
 
 def build_manifest(sources):
@@ -2140,6 +2170,16 @@ def _load_tape(ctx, tape):
     return False
 
 
+def _verify_one(job):
+    fp, sp, size = job
+    try:
+        if not os.path.isfile(sp) or os.path.getsize(sp) != size:
+            return False
+        return _sha256_file(sp) == _sha256_file(fp)
+    except OSError:
+        return False
+
+
 def _verify_from_tape(ctx, c, cands):
     """Read the chunk(s) holding the candidates back from tape and compare
     the file contents byte for byte (sha256).  Returns {fp: bool}."""
@@ -2197,15 +2237,10 @@ def _verify_from_tape(ctx, c, cands):
                 if r.returncode not in (0, 1):
                     raise RuntimeError("tar extract failed (%d)"
                                        % r.returncode)
-            for it in items:
-                sp = os.path.join(tmp, it["rel"])
-                try:
-                    if not os.path.isfile(sp) or os.path.getsize(sp) != it["size"]:
-                        res[it["fp"]] = False
-                        continue
-                    res[it["fp"]] = (_sha256_file(sp) == _sha256_file(it["fp"]))
-                except OSError:
-                    res[it["fp"]] = False
+            jobs = [(it["fp"], os.path.join(tmp, it["rel"]), it["size"])
+                    for it in items]
+            for it, ok in zip(items, map_jobs(ctx, _verify_one, jobs)):
+                res[it["fp"]] = ok
         except Exception as e:
             print("VERIFY ERROR (%s) for session %s" % (e, sid[:8]))
             for it in items:
@@ -2460,6 +2495,7 @@ Commands:
   sessions                    list sessions
 Global flag:
   -n, --dry-run               print plan, touch nothing
+  -j, --jobs N                worker processes for per-file work (default 1)
 """)
 
 
@@ -2478,14 +2514,29 @@ def main():
         _erase_cmd(argv)
         return
     dry = False
-    if argv and argv[0] in ("-n", "--dry-run"):
-        dry = True
-        argv = argv[1:]
+    jobs = None
+    while argv:
+        if argv[0] in ("-n", "--dry-run"):
+            dry = True
+            argv = argv[1:]
+        elif argv[0] in ("-j", "--jobs") and len(argv) > 1:
+            jobs = int(argv[1])
+            argv = argv[2:]
+        elif argv[0].startswith("--jobs="):
+            jobs = int(argv[0].split("=", 1)[1])
+            argv = argv[1:]
+        elif argv[0].startswith("-j") and argv[0][2:].isdigit():
+            jobs = int(argv[0][2:])
+            argv = argv[1:]
+        else:
+            break
     if not argv or argv[0] in ("-h", "--help", "help"):
         usage()
         return
     cmd, args = argv[0], argv[1:]
     ctx = Ctx(dry=dry)
+    if jobs is not None:
+        ctx.jobs = max(1, jobs)
     try:
         if cmd == "init":
             cmd_init(ctx, args)
