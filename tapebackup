@@ -2032,9 +2032,10 @@ def cmd_ls(ctx, args):
     cmain = db_open(ctx)
     cd = dir_index_open(ctx)
     ensure_dir_index(ctx, cmain, cd)
+    hosts = [host] if host else [r[0] for r in cmain.execute(
+        "SELECT DISTINCT host_name FROM sessions WHERE host_name IS NOT NULL"
+        " ORDER BY host_name")]
     cmain.close()
-    hosts = [host] if host else [r[0] for r in cd.execute(
-        "SELECT DISTINCT host FROM dir_index ORDER BY host")]
     if not target:
         for h in hosts:
             printed = False
