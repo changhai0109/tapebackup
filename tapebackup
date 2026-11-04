@@ -14,7 +14,7 @@
 #     tape order, later rows win (per-key). No fixed reservation, no seeks.
 #
 # Environment:
-#   TAPEBACKUP_DIR       default ~/tapebackup
+#   TAPEBACKUP_DIR       default ~/.cache/tapebackup
 #   TAPEBACKUP_DEV       default /dev/nst0
 #   TAPEBACKUP_RHOST     remote drive host (uses ssh+rmt); empty = local drive
 #   TAPEBACKUP_RPORT     ssh port for remote host
@@ -303,7 +303,7 @@ def mam_snapshot(stdev):
 
 class Ctx:
     def __init__(self, dry=False):
-        self.dir = os.path.expanduser(os.environ.get("TAPEBACKUP_DIR", "~/tapebackup"))
+        self.dir = os.path.expanduser(os.environ.get("TAPEBACKUP_DIR", "~/.cache/tapebackup"))
         self.dbpath = os.path.join(self.dir, "index.db")
         self.dev = os.environ.get("TAPEBACKUP_DEV", "/dev/nst0")
         self.rhost = os.environ.get("TAPEBACKUP_RHOST", "")
