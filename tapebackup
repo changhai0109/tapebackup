@@ -1900,8 +1900,124 @@ def cmd_versions(ctx, args):
             host, started, human(size), mts, tape or "-", sid[:8]))
 
 
+DIR_INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS dir_index(
+  host TEXT NOT NULL, parent TEXT NOT NULL, name TEXT NOT NULL,
+  is_dir INTEGER NOT NULL, size INTEGER, n_files INTEGER, mtime INTEGER,
+  started TEXT, tape TEXT, file_no INTEGER,
+  PRIMARY KEY(host,parent,name)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS dir_built(sid TEXT PRIMARY KEY);
+"""
+
+_UPSERT_DIR = (
+    "INSERT INTO dir_index(host,parent,name,is_dir,size,n_files,mtime,started,tape,file_no)"
+    " VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(host,parent,name) DO UPDATE SET"
+    " is_dir=excluded.is_dir, size=excluded.size, n_files=excluded.n_files,"
+    " mtime=excluded.mtime, started=excluded.started, tape=excluded.tape,"
+    " file_no=excluded.file_no WHERE excluded.started >= dir_index.started")
+
+_ADD_DIR = (
+    "INSERT INTO dir_index(host,parent,name,is_dir,size,n_files,mtime,started,tape,file_no)"
+    " VALUES(?,?,?,1,?,?,NULL,?,?,?) ON CONFLICT(host,parent,name) DO UPDATE SET"
+    " size=coalesce(dir_index.size,0)+excluded.size,"
+    " n_files=coalesce(dir_index.n_files,0)+excluded.n_files,"
+    " started=excluded.started, tape=excluded.tape, file_no=excluded.file_no")
+
+
+def dir_index_open(ctx):
+    """Aux DB holding a directory tree (parent/name). Kept in its own file so
+    building/refreshing it never competes with index writes of a live backup."""
+    p = os.path.join(ctx.dir, "dir_index.db")
+    c = sqlite3.connect(p, timeout=30)
+    c.executescript(DIR_INDEX_SCHEMA)
+    return c
+
+
+def ensure_dir_index(ctx, cmain, cd):
+    """Incrementally fold sessions that are not in dir_index yet.
+
+    Sessions are chunks, so several sessions can cover one tree.  File rows
+    keep the newest version; directory rows keep running totals, adjusted by
+    the delta when a newer session changes (or re-adds) a file."""
+    built = {r[0] for r in cd.execute("SELECT sid FROM dir_built")}
+    todo = [r for r in cmain.execute(
+                "SELECT sid,host_name,started FROM sessions ORDER BY started, sid")
+            if r[0] not in built]
+    cd.execute("CREATE TEMP TABLE IF NOT EXISTS _nf("
+               "parent TEXT, name TEXT, size INTEGER, mtime INTEGER)")
+    for sid, host, started in todo:
+        st = cmain.execute("SELECT tape,file_no FROM session_tapes"
+                           " WHERE sid=? AND seq=1", (sid,)).fetchone()
+        tape, fno = (st[0], st[1]) if st else (None, None)
+        cd.execute("DELETE FROM _nf")
+        batch = []
+        for path, size, mtime in cmain.execute(
+                "SELECT path,size,mtime FROM file_index WHERE sid=?", (sid,)):
+            if "/" in path:
+                parent, name = path.rsplit("/", 1)
+            else:
+                parent, name = "", path
+            batch.append((parent, name, size, mtime))
+            if len(batch) >= 50000:
+                cd.executemany("INSERT INTO _nf VALUES(?,?,?,?)", batch)
+                batch = []
+        if batch:
+            cd.executemany("INSERT INTO _nf VALUES(?,?,?,?)", batch)
+        rows = cd.execute(
+            "SELECT n.parent,n.name,n.size,n.mtime,d.size,d.started"
+            " FROM _nf n LEFT JOIN dir_index d"
+            "   ON d.host=? AND d.parent=n.parent AND d.name=n.name",
+            (host,)).fetchall()
+        files, deltas = [], {}
+        for parent, name, size, mtime, oldsize, oldstarted in rows:
+            if oldstarted and started and started < oldstarted:
+                continue
+            sz = size or 0
+            if oldsize is None:
+                dn, delta = 1, sz
+            else:
+                dn, delta = 0, sz - (oldsize or 0)
+            files.append((host, parent, name, 0, size, None, mtime,
+                          started, tape, fno))
+            d = parent
+            while d:
+                p2, _, n2 = d.rpartition("/")
+                e = deltas.get((p2, n2))
+                if e is None:
+                    deltas[(p2, n2)] = [dn, delta]
+                else:
+                    e[0] += dn
+                    e[1] += delta
+                d = p2
+        cd.executemany(_UPSERT_DIR, files)
+        cd.executemany(_ADD_DIR,
+                       [(host, p, n, delta_bytes, dn, started, tape, fno)
+                        for (p, n), (dn, delta_bytes) in deltas.items()])
+        cd.execute("INSERT OR REPLACE INTO dir_built(sid) VALUES(?)", (sid,))
+        cd.commit()
+    return len(todo)
+
+
+def _ls_children(cd, host, parent):
+    return cd.execute(
+        "SELECT name,is_dir,size,n_files,mtime,started,tape,file_no"
+        " FROM dir_index WHERE host=? AND parent=? ORDER BY name",
+        (host, parent)).fetchall()
+
+
+def _ls_walk(cd, host, parent, base):
+    for name, isdir, size, nf, mtime, started, tape, fno in _ls_children(cd, host, parent):
+        p = (base + "/" + name) if base else name
+        if isdir:
+            _ls_walk(cd, host, p, p)
+        else:
+            mts = time.strftime("%Y-%m-%d", time.localtime(mtime)) if mtime else "-"
+            print("%-10s %-19s %-10s %10s %-24s %s" % (
+                host, started, human(size), mts, tape or "-", p))
+
+
 def cmd_ls(ctx, args):
-    """Browse the index: ls [-R] [HOST:]PATH  (deduplicated: latest version wins)"""
+    """Browse the index: ls [-R] [HOST:]PATH  (latest version wins)"""
     recursive = any(a in ("-R", "--recursive") for a in args)
     args = [a for a in args if a not in ("-R", "--recursive")]
     target = args[0] if args else None
@@ -1913,99 +2029,58 @@ def cmd_ls(ctx, args):
         else:
             path = target
         path = path.lstrip("/").rstrip("/")
-    c = db_open(ctx)
-    base = ("SELECT s.host_name, f.path, f.size, f.mtime, s.started, st.tape, st.file_no"
-            " FROM file_index f JOIN sessions s ON s.sid=f.sid"
-            " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1")
-    wh, params = [], []
-    if host:
-        wh.append("s.host_name = ?")
-        params.append(host)
-    if path:
-        wh.append("(f.path = ? OR f.path LIKE ?)")
-        params += [path, path + "/%"]
-    rows = c.execute(base + ((" WHERE " + " AND ".join(wh)) if wh else ""), params).fetchall()
-    c.close()
-
-    # dedupe: same (host,path) keeps the latest session; remember version count
-    ded = {}
-    for h, p, sz, mt, started, tape, fno in rows:
-        k = (h, p)
-        d = ded.get(k)
-        if d is None:
-            ded[k] = {"size": sz, "mtime": mt, "started": started,
-                      "tape": tape, "fno": fno, "n": 1}
-        else:
-            d["n"] += 1
-            if started > d["started"]:
-                d.update(size=sz, mtime=mt, started=started, tape=tape, fno=fno)
-
+    cmain = db_open(ctx)
+    cd = dir_index_open(ctx)
+    ensure_dir_index(ctx, cmain, cd)
+    cmain.close()
+    hosts = [host] if host else [r[0] for r in cd.execute(
+        "SELECT DISTINCT host FROM dir_index ORDER BY host")]
     if not target:
-        agg = {}
-        for (h, p), d in ded.items():
-            top = p.split("/", 1)[0]
-            a = agg.setdefault((h, top), [0, 0])
-            a[0] += 1
-            a[1] += d["size"] or 0
-        cur = None
-        for (h, top), (n, sz) in sorted(agg.items()):
-            if h != cur:
-                print("%s:" % h)
-                cur = h
-            print("  d  %-40s %6d files  %10s" % (top + "/", n, human(sz)))
+        for h in hosts:
+            printed = False
+            for name, isdir, size, nf, mtime, started, tape, fno in _ls_children(cd, h, ""):
+                if not printed:
+                    print("%s:" % h)
+                    printed = True
+                if isdir:
+                    print("  d  %-40s %6d files  %10s" % (
+                        name + "/", nf or 0, human(size or 0)))
+                else:
+                    print("  f  %-40s %10s" % (name, human(size or 0)))
+        cd.close()
         return
-
-    if path and not ded:
-        print("(nothing under %s)" % (target,))
-        return
-
     if recursive:
         print("%-10s %-19s %-10s %10s %-24s %s" % (
             "host", "backup time", "size", "mtime", "tape", "path"))
-        for (h, p), d in sorted(ded.items()):
-            if p == path:
-                mts = time.strftime("%Y-%m-%d %H:%M", time.localtime(d["mtime"])) if d["mtime"] else "-"
-                print("%-10s %-19s %-10s %10s %-24s %s" % (
-                    h, d["started"], human(d["size"]), mts, d["tape"] or "-", p))
-                continue
-            mts = time.strftime("%Y-%m-%d", time.localtime(d["mtime"])) if d["mtime"] else "-"
-            mark = "  x%d" % d["n"] if d["n"] > 1 else ""
-            print("%-10s %-19s %-10s %10s %-24s %s%s" % (
-                h, d["started"], human(d["size"]), mts, d["tape"] or "-", p, mark))
+        for h in hosts:
+            _ls_walk(cd, h, path, path)
+        cd.close()
         return
-
-    prefix = (path + "/") if path else ""
-    agg = {}
-    exact = []
-    for (h, p), d in ded.items():
-        if p == path:
-            exact.append((h, p, d))
+    found = False
+    for h in hosts:
+        rows = _ls_children(cd, h, path)
+        if not rows:
             continue
-        rel = p[len(prefix):] if p.startswith(prefix) else None
-        if not rel:
-            continue
-        first, sep, _ = rel.partition("/")
-        key = (h, first)
-        a = agg.setdefault(key, {"n": 0, "sz": 0, "isfile": True, "ver": 0})
-        a["n"] += 1
-        a["sz"] += d["size"] or 0
-        a["ver"] = max(a["ver"], d["n"])
-        if sep:
-            a["isfile"] = False
-    cur = None
-    for (h, name), a in sorted(agg.items()):
-        if h != cur:
-            print("%s:" % h)
-            cur = h
-        mark = "  x%d" % a["ver"] if a["ver"] > 1 else ""
-        if a["isfile"]:
-            print("  f  %-44s %10s%s" % (name, human(a["sz"]), mark))
-        else:
-            print("  d  %-44s %10s  (%d files)%s" % (
-                name + "/", human(a["sz"]), a["n"], mark))
-    for h, p, d in exact:
-        mark = "  x%d" % d["n"] if d["n"] > 1 else ""
-        print("%-10s %-10s %-24s %s%s" % (h, human(d["size"]), d["tape"] or "-", p, mark))
+        found = True
+        print("%s:" % h)
+        for name, isdir, size, nf, mtime, started, tape, fno in rows:
+            if isdir:
+                print("  d  %-44s %10s  (%d files)" % (
+                    name + "/", human(size or 0), nf or 0))
+            else:
+                print("  f  %-44s %10s" % (name, human(size or 0)))
+    if not found:
+        parent, _, name = path.rpartition("/")
+        for h in hosts:
+            row = cd.execute(
+                "SELECT size,tape FROM dir_index WHERE host=? AND parent=? AND name=?",
+                (h, parent, name)).fetchone()
+            if row:
+                found = True
+                print("%-10s %-10s %-24s %s" % (h, human(row[0]), row[1] or "-", path))
+        if not found:
+            print("(nothing under %s)" % (target,))
+    cd.close()
 
 
 def cmd_tapes(ctx, args):

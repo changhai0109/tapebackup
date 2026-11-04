@@ -8,3 +8,5 @@ runs/
 temp.log
 __pycache__/
 *.pyc
+dir_index.db
+dir_index.db-*
