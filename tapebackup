@@ -1115,32 +1115,54 @@ def map_jobs(ctx, fn, items, init=None, initargs=()):
     return list(_pool_get(n, init, initargs).map(fn, items))
 
 
-def _scan_dir(path):
-    """Worker: list one directory (no symlink following)."""
-    files, dirs = [], []
-    try:
-        with os.scandir(path) as it:
-            for e in it:
-                try:
-                    if e.is_dir(follow_symlinks=False):
-                        dirs.append(e.path)
-                    elif e.is_file(follow_symlinks=False):
-                        st = e.stat(follow_symlinks=False)
-                        files.append((e.path, st.st_size, int(st.st_mtime)))
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return files, dirs
+def _scan_dir(path, split):
+    """Worker for walk_tree.
+
+    split=True  -> list only this directory: (files, subdirs, [path])
+    split=False -> the pool is saturated, walk the whole subtree here and
+                   return (files, [], all visited dirs)
+    """
+    files = []
+    if split:
+        dirs = []
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            dirs.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            st = e.stat(follow_symlinks=False)
+                            files.append((e.path, st.st_size, int(st.st_mtime)))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return files, dirs, [path]
+    visited = []
+    for root, _dns, fns in os.walk(path):
+        visited.append(root)
+        for fn in fns:
+            fp = os.path.join(root, fn)
+            if os.path.islink(fp):
+                continue
+            try:
+                st = os.lstat(fp)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                files.append((fp, st.st_size, int(st.st_mtime)))
+    return files, [], visited
 
 
 def walk_tree(ctx, roots):
     """Walk directories breadth-first; returns (files, dirs).
 
-    With ctx.jobs > 1 the scan is divided over the process pool: the main
-    process keeps a queue of directories, workers list one directory each
-    (files + subdirectories), and new subdirectories are fed back into the
-    queue.  jobs == 1 falls back to plain os.walk."""
+    With ctx.jobs > 1 the scan is divided over the process pool until the
+    pool plus queue holds window (4*jobs) items; after that workers stop
+    splitting and walk their subtree serially, so task overhead stays low.
+
+    jobs == 1 falls back to plain os.walk."""
     files, dirs = [], []
     n = getattr(ctx, "jobs", 1) or 1
     if n <= 1:
@@ -1179,17 +1201,18 @@ def walk_tree(ctx, roots):
     while pending or inflight:
         while pending and len(inflight) < window:
             d = pending.popleft()
-            dirs.append(d)
-            inflight[ex.submit(_scan_dir, d)] = d
+            split = (len(inflight) + len(pending)) < window
+            inflight[ex.submit(_scan_dir, d, split)] = d
         done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
         for fut in done:
             inflight.pop(fut, None)
             try:
-                fl, dl = fut.result()
+                fl, nd, vd = fut.result()
             except Exception:
                 continue
             files.extend(fl)
-            pending.extend(dl)
+            dirs.extend(vd)
+            pending.extend(nd)
     return files, dirs
 
 
@@ -2402,12 +2425,15 @@ def cmd_remove(ctx, args):
     work = []
     skipped = []
     dirs = set()
+    roots = set()
     for target in args:
         ap = _resolve_input(target)
         if os.path.islink(ap) or not os.path.exists(ap):
             print("SKIP (missing or symlink): %s" % target)
             skipped.append((target, "missing or symlink"))
             continue
+        if os.path.isdir(ap):
+            roots.add(ap)
         fs, ds = walk_tree(ctx, [ap])
         dirs.update(ds)
         for fp, _sz, _mt in fs:
@@ -2448,6 +2474,8 @@ def cmd_remove(ctx, args):
         okbytes += it["size"]
     if prune and yes:
         for d in sorted(dirs, key=len, reverse=True):
+            if d in roots:
+                continue
             try:
                 if os.path.isdir(d) and not os.listdir(d):
                     os.rmdir(d)
