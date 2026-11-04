@@ -1051,9 +1051,32 @@ def parse_size(v):
     return int(float(m.group(1)) * mult)
 
 
+def _resolve_input(target):
+    """Map a user-supplied path to an absolute filesystem path.
+
+    Absolute paths are used as-is.  Relative paths are interpreted relative
+    to / (the index/tar canonical space) when that path exists, otherwise
+    relative to the current directory; '.' and '..' style paths always stay
+    relative to the current directory."""
+    if not target:
+        return ""
+    if os.path.isabs(target):
+        return os.path.normpath(target)
+    if target in (".", "..") or target.startswith("./") or target.startswith("../"):
+        return os.path.abspath(target)
+    root = os.path.normpath("/" + target)
+    if os.path.exists(root):
+        return root
+    cwd = os.path.abspath(target)
+    if os.path.exists(cwd):
+        return cwd
+    return root
+
+
 def build_manifest(sources):
     files = []
     for src in sources:
+        src = os.path.abspath(src)
         if os.path.isdir(src):
             for root, dirs, fs in os.walk(src):
                 dirs.sort()
@@ -1511,7 +1534,7 @@ def cmd_extract(ctx, args):
             at = args[i + 1]
             i += 2
         else:
-            paths.append(a)
+            paths.append(_resolve_input(a).lstrip("/"))
             i += 1
     if not dest or not os.path.isdir(dest):
         die("usage: extract -C DESTDIR [--sid N | PATH...]")
@@ -1882,7 +1905,7 @@ def cmd_monitor(ctx, args):
 def cmd_versions(ctx, args):
     if not args:
         die("usage: versions PATH")
-    p = args[0].lstrip("/")
+    p = _resolve_input(args[0]).lstrip("/")
     c = db_open(ctx)
     rows = c.execute(
         "SELECT s.host_name, s.started, f.size, f.mtime, st.tape, st.file_no, s.sid"
@@ -2029,7 +2052,7 @@ def cmd_ls(ctx, args):
             host, path = target.split(":", 1)
         else:
             path = target
-        path = path.lstrip("/").rstrip("/")
+        path = _resolve_input(path).lstrip("/").rstrip("/")
     cmain = db_open(ctx)
     cd = dir_index_open(ctx)
     ensure_dir_index(ctx, cmain, cd)
@@ -2222,7 +2245,7 @@ def cmd_remove(ctx, args):
     skipped = []
     dirs = set()
     for target in args:
-        ap = os.path.abspath(target)
+        ap = _resolve_input(target)
         if os.path.islink(ap) or not os.path.exists(ap):
             print("SKIP (missing or symlink): %s" % target)
             skipped.append((target, "missing or symlink"))
