@@ -1076,11 +1076,19 @@ def _resolve_input(target):
 
 _POOL = None
 _POOL_N = None
+_POOL_INIT = None
 
 
 def _pool_get(n, init=None, initargs=()):
-    global _POOL, _POOL_N
-    if _POOL is None or _POOL_N != n:
+    global _POOL, _POOL_N, _POOL_INIT
+    key = (init, tuple(initargs))
+    if _POOL is not None and (_POOL_N != n or _POOL_INIT != key):
+        try:
+            _POOL.shutdown(wait=True)
+        except Exception:
+            pass
+        _POOL = None
+    if _POOL is None:
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
         # fork keeps __main__ (this single-file tool) available in workers
@@ -1088,6 +1096,7 @@ def _pool_get(n, init=None, initargs=()):
         _POOL = ProcessPoolExecutor(max_workers=n, mp_context=mpctx,
                                     initializer=init, initargs=initargs)
         _POOL_N = n
+        _POOL_INIT = key
     return _POOL
 
 
@@ -1106,28 +1115,101 @@ def map_jobs(ctx, fn, items, init=None, initargs=()):
     return list(_pool_get(n, init, initargs).map(fn, items))
 
 
-def build_manifest(sources):
+def _scan_dir(path):
+    """Worker: list one directory (no symlink following)."""
+    files, dirs = [], []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        dirs.append(e.path)
+                    elif e.is_file(follow_symlinks=False):
+                        st = e.stat(follow_symlinks=False)
+                        files.append((e.path, st.st_size, int(st.st_mtime)))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return files, dirs
+
+
+def walk_tree(ctx, roots):
+    """Walk directories breadth-first; returns (files, dirs).
+
+    With ctx.jobs > 1 the scan is divided over the process pool: the main
+    process keeps a queue of directories, workers list one directory each
+    (files + subdirectories), and new subdirectories are fed back into the
+    queue.  jobs == 1 falls back to plain os.walk."""
+    files, dirs = [], []
+    n = getattr(ctx, "jobs", 1) or 1
+    if n <= 1:
+        for src in roots:
+            if os.path.isdir(src) and not os.path.islink(src):
+                for root, _dns, fns in os.walk(src):
+                    dirs.append(root)
+                    for fn in fns:
+                        fp = os.path.join(root, fn)
+                        if os.path.islink(fp):
+                            continue
+                        try:
+                            st = os.lstat(fp)
+                        except OSError:
+                            continue
+                        if stat.S_ISREG(st.st_mode):
+                            files.append((fp, st.st_size, int(st.st_mtime)))
+            elif os.path.isfile(src) and not os.path.islink(src):
+                st = os.lstat(src)
+                if stat.S_ISREG(st.st_mode):
+                    files.append((src, st.st_size, int(st.st_mtime)))
+        return files, dirs
+    from collections import deque
+    from concurrent.futures import wait, FIRST_COMPLETED
+    ex = _pool_get(n)
+    pending = deque()
+    for src in roots:
+        if os.path.isdir(src) and not os.path.islink(src):
+            pending.append(src)
+        elif os.path.isfile(src) and not os.path.islink(src):
+            st = os.lstat(src)
+            if stat.S_ISREG(st.st_mode):
+                files.append((src, st.st_size, int(st.st_mtime)))
+    inflight = {}
+    window = max(4, 4 * n)
+    while pending or inflight:
+        while pending and len(inflight) < window:
+            d = pending.popleft()
+            dirs.append(d)
+            inflight[ex.submit(_scan_dir, d)] = d
+        done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+        for fut in done:
+            inflight.pop(fut, None)
+            try:
+                fl, dl = fut.result()
+            except Exception:
+                continue
+            files.extend(fl)
+            pending.extend(dl)
+    return files, dirs
+
+
+def build_manifest(ctx, sources):
     files = []
+    dir_sources = []
     for src in sources:
         src = os.path.abspath(src)
         if os.path.isdir(src):
-            for root, dirs, fs in os.walk(src):
-                dirs.sort()
-                fs.sort()
-                for fn in fs:
-                    fp = os.path.join(root, fn)
-                    try:
-                        stt = os.lstat(fp)
-                    except OSError:
-                        continue
-                    if not stat.S_ISREG(stt.st_mode):
-                        continue
-                    files.append((fp, stt.st_size, int(stt.st_mtime)))
+            dir_sources.append(src)
         elif os.path.exists(src):
-            stt = os.stat(src)
+            stt = os.lstat(src)
+            if not stat.S_ISREG(stt.st_mode):
+                die("not a regular file: %s" % src)
             files.append((src, stt.st_size, int(stt.st_mtime)))
         else:
             die("no such path: %s" % src)
+    if dir_sources:
+        more, _dirs = walk_tree(ctx, dir_sources)
+        files.extend(more)
     files.sort()
     return files
 
@@ -1363,7 +1445,7 @@ def cmd_write(ctx, args):
         del args[i:i + 2]
     if not args:
         die("usage: write [--force] [--chunk-size 50G] SRC...")
-    files = build_manifest(args)
+    files = build_manifest(ctx, args)
     if not files:
         die("nothing to back up")
     chunks = split_chunks(files, chunk_bytes)
@@ -2282,7 +2364,9 @@ def _verify_from_tape(ctx, c, cands):
                                        % r.returncode)
             jobs = [(it["fp"], os.path.join(tmp, it["rel"]), it["size"])
                     for it in items]
-            for it, ok in zip(items, map_jobs(ctx, _verify_one, jobs)):
+            for it, ok in zip(items, map_jobs(ctx, _verify_one, jobs,
+                                              init=_worker_init,
+                                              initargs=(ctx.dbpath, ctx.host_name))):
                 res[it["fp"]] = ok
         except Exception as e:
             print("VERIFY ERROR (%s) for session %s" % (e, sid[:8]))
@@ -2324,16 +2408,11 @@ def cmd_remove(ctx, args):
             print("SKIP (missing or symlink): %s" % target)
             skipped.append((target, "missing or symlink"))
             continue
-        if os.path.isdir(ap):
-            for root, _dns, fns in os.walk(ap):
-                dirs.add(root)
-                for fn in fns:
-                    fp = os.path.join(root, fn)
-                    if os.path.islink(fp) or not os.path.isfile(fp):
-                        continue
-                    work.append((fp, fp.lstrip("/")))
-        else:
-            work.append((ap, ap.lstrip("/")))
+        fs, ds = walk_tree(ctx, [ap])
+        dirs.update(ds)
+        for fp, _sz, _mt in fs:
+            work.append((fp, fp.lstrip("/")))
+        if not os.path.isdir(ap):
             dirs.add(os.path.dirname(ap))
     cands = []
     for r in map_jobs(ctx, _remove_check, work, init=_worker_init,
@@ -2506,7 +2585,7 @@ Commands:
   sessions                    list sessions
 Global flag:
   -n, --dry-run               print plan, touch nothing
-  -j, --jobs N                worker processes for per-file work (default 1)
+  -j, --jobs N                worker processes for per-file/tree work (default 1)
 """)
 
 
