@@ -25,7 +25,9 @@
 import argparse
 import ctypes
 import fcntl
+import fnmatch
 import getpass
+import glob
 import hashlib
 import json
 import os
@@ -1163,6 +1165,43 @@ def _resolve_input(target):
     return root
 
 
+def _index_path(target):
+    """Convert an index path without consulting the local filesystem."""
+    if target in (".", "..") or target.startswith(("./", "../")):
+        return os.path.abspath(target).lstrip("/")
+    return os.path.normpath("/" + target.lstrip("/")).lstrip("/")
+
+
+def _local_patterns(targets):
+    """Expand quoted shell-style patterns against local files, failing closed."""
+    result = []
+    for target in targets:
+        if glob.has_magic(target) and not os.path.lexists(target):
+            matches = sorted(glob.glob(target))
+            if not matches:
+                die("pattern matched no local paths: %s" % target)
+            result.extend(matches)
+        else:
+            result.append(target)
+    return result
+
+
+def _index_matches(c, pattern):
+    """Match indexed file paths, with shell wildcards confined to one component."""
+    pattern = _index_path(pattern)
+    if not glob.has_magic(pattern):
+        return [pattern]
+    prefix = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
+    # A lexical range avoids scanning unrelated portions of the index.
+    rows = c.execute("SELECT DISTINCT path FROM file_index WHERE path>=? AND path<? ORDER BY path",
+                     (prefix, prefix + "\U0010ffff"))
+    parts = pattern.split("/")
+    return [row[0] for row in rows if len(row[0].split("/")) == len(parts)
+            and all(fnmatch.fnmatchcase(name, pat) and
+                    (not name.startswith(".") or pat.startswith("."))
+                    for name, pat in zip(row[0].split("/"), parts))]
+
+
 _POOL = None
 _POOL_N = None
 _POOL_INIT = None
@@ -1627,7 +1666,8 @@ def cmd_write(ctx, args):
         del args[i:i + 2]
     if not args and not literals:
         die("usage: write [--force] [--chunk-size 50G] SRC...")
-    files = build_manifest(ctx, args + literals)
+    args = _local_patterns(args) + literals
+    files = build_manifest(ctx, args)
     if not files:
         die("nothing to back up")
     chunks = split_chunks(files, chunk_bytes)
@@ -1786,7 +1826,11 @@ def cmd_find(ctx, args):
     if not args:
         die("usage: find [--all] PATTERN")
     c = db_open(ctx)
-    pat = "%" + args[0] + "%"
+    pattern = args[0]
+    if pattern.startswith(("./", "../", "/")):
+        pattern = _index_path(pattern)
+    is_glob = glob.has_magic(pattern)
+    pat = "*" + pattern + "*" if is_glob else "%" + pattern + "%"
     base = """
       SELECT f.path, f.size, f.mtime, s.started, s.host_name, st.tape, st.file_no, s.sid,
              COUNT(*) OVER (PARTITION BY s.host_name, f.path) AS vcount,
@@ -1794,8 +1838,9 @@ def cmd_find(ctx, args):
                                 ORDER BY s.started DESC, s.sid DESC) AS rn
       FROM file_index f JOIN sessions s ON s.sid=f.sid
       LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1
-      WHERE f.path LIKE ?
+      WHERE f.path %s ?
     """
+    base = base % ("GLOB" if is_glob else "LIKE")
     q = ("SELECT * FROM (%s) ORDER BY path, started DESC LIMIT 500" % base) if show_all \
         else ("SELECT * FROM (%s) WHERE rn=1 ORDER BY path LIMIT 500" % base)
     rows = c.execute(q, (pat,)).fetchall()
@@ -1817,7 +1862,8 @@ def cmd_extract(ctx, args):
     runid = None
     at = None
     opts, literals = _split_literal(args)
-    paths = [_resolve_input(a).lstrip("/") for a in literals]
+    literal_paths = [_index_path(a) for a in literals]
+    paths = []
     i = 0
     while i < len(opts):
         a = opts[i]
@@ -1834,11 +1880,25 @@ def cmd_extract(ctx, args):
             at = opts[i + 1]
             i += 2
         else:
-            paths.append(_resolve_input(a).lstrip("/"))
+            paths.append(_index_path(a))
             i += 1
     if not dest or not os.path.isdir(dest):
         die("usage: extract -C DESTDIR [--sid N | PATH...]")
     c = db_open(ctx)
+    if paths:
+        expanded = []
+        for p in paths:
+            matches = _index_matches(c, p)
+            if sid and glob.has_magic(p):
+                matches = [m for m in matches if c.execute(
+                    "SELECT 1 FROM file_index WHERE path=? AND sid LIKE ? LIMIT 1",
+                    (m, sid + "%")).fetchone()]
+            if not matches:
+                c.close()
+                die("pattern matched no indexed files: %s" % p)
+            expanded.extend(matches)
+        paths = expanded
+    paths = list(dict.fromkeys(paths + literal_paths))
     if runid:
         rows = c.execute(
             "SELECT s.sid, st.tape, st.file_no FROM sessions s"
@@ -1905,7 +1965,18 @@ def cmd_extract(ctx, args):
                       % (nver, p, row[1]))
             sids.add(row[0])
         if len(sids) > 1:
-            die("the given paths belong to different sessions; extract them separately or use --sid")
+            # Resolve and restore one session at a time, without shell expansion.
+            groups = {}
+            for p in paths:
+                if at:
+                    row = c.execute("SELECT s.sid FROM file_index f JOIN sessions s ON s.sid=f.sid WHERE f.path=? AND s.started<=? ORDER BY s.started DESC LIMIT 1", (p, at)).fetchone()
+                else:
+                    row = c.execute("SELECT s.sid FROM file_index f JOIN sessions s ON s.sid=f.sid WHERE f.path=? ORDER BY s.started DESC LIMIT 1", (p,)).fetchone()
+                groups.setdefault(row[0], []).append(p)
+            c.close()
+            for group_sid, group_paths in groups.items():
+                cmd_extract(ctx, ["-C", dest, "--sid", group_sid, "--"] + group_paths)
+            return
         sid = sids.pop()
     tapes = c.execute("SELECT seq,tape,file_no FROM session_tapes WHERE sid=? ORDER BY seq",
                       (sid,)).fetchall()
@@ -2220,23 +2291,28 @@ def cmd_monitor(ctx, args):
 def cmd_versions(ctx, args):
     if not args:
         die("usage: versions PATH")
-    p = _resolve_input(args[0]).lstrip("/")
+    p = _index_path(args[0])
     c = db_open(ctx)
-    rows = c.execute(
+    matches = _index_matches(c, p)
+    rows_by_path = [(match, c.execute(
         "SELECT s.host_name, s.started, f.size, f.mtime, st.tape, st.file_no, s.sid"
         " FROM file_index f JOIN sessions s ON s.sid=f.sid"
         " LEFT JOIN session_tapes st ON st.sid=f.sid AND st.seq=1"
-        " WHERE f.path=? ORDER BY s.started DESC", (p,)).fetchall()
+        " WHERE f.path=? ORDER BY s.started DESC", (match,)).fetchall())
+                    for match in matches]
     c.close()
-    if not rows:
+    if not rows_by_path or not any(rows for _, rows in rows_by_path):
         print("(no versions for %s)" % p)
         return
-    print("%-10s %-19s %-10s %-19s %-24s %s" % (
-        "host", "backup time", "size", "file mtime", "tape", "sid"))
-    for host, started, size, mt, tape, fno, sid in rows:
-        mts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mt)) if mt else "-"
+    for match, rows in rows_by_path:
+        if glob.has_magic(p):
+            print("%s:" % match)
         print("%-10s %-19s %-10s %-19s %-24s %s" % (
-            host, started, human(size), mts, tape or "-", sid[:8]))
+            "host", "backup time", "size", "file mtime", "tape", "sid"))
+        for host, started, size, mt, tape, fno, sid in rows:
+            mts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mt)) if mt else "-"
+            print("%-10s %-19s %-10s %-19s %-24s %s" % (
+                host, started, human(size), mts, tape or "-", sid[:8]))
 
 
 DIR_INDEX_SCHEMA = """
@@ -2371,10 +2447,14 @@ def _ls_walk(cd, host, parent, base):
                 host, started, human(size), mts, tape or "-", p))
 
 
-def cmd_ls(ctx, args):
+def cmd_ls(ctx, args, _literal=False, _entry_only=False):
     """Browse the index: ls [-R] [HOST:]PATH  (latest version wins)"""
     recursive = any(a in ("-R", "--recursive") for a in args)
     args = [a for a in args if a not in ("-R", "--recursive")]
+    if len(args) > 1:
+        for item in args:
+            cmd_ls(ctx, (["-R"] if recursive else []) + [item], _entry_only=True)
+        return
     target = args[0] if args else None
     host = None
     path = ""
@@ -2383,10 +2463,45 @@ def cmd_ls(ctx, args):
             host, path = target.split(":", 1)
         else:
             path = target
-        path = _resolve_input(path).lstrip("/").rstrip("/")
+        path = _index_path(path).rstrip("/")
     cmain = db_open(ctx)
     cd = dir_index_open(ctx)
     ensure_dir_index(ctx, cmain, cd)
+    if target and not _literal and glob.has_magic(path):
+        prefix = re.split(r"[*?\[]", path, maxsplit=1)[0]
+        parts = path.split("/")
+        rows = cd.execute("SELECT host,parent,name,is_dir,size,n_files FROM dir_index WHERE (? IS NULL OR host=?)", (host, host))
+        matches = []
+        for h, parent, name, isdir, size, nf in rows:
+            candidate = (parent + "/" + name).lstrip("/")
+            names = candidate.split("/")
+            if candidate.startswith(prefix) and len(names) == len(parts) and all(
+                    fnmatch.fnmatchcase(n, p) and (not n.startswith(".") or p.startswith("."))
+                    for n, p in zip(names, parts)):
+                matches.append((candidate, h, isdir, size, nf))
+        cmain.close()
+        cd.close()
+        if not matches:
+            print("(no match)")
+        for match, h, isdir, size, nf in sorted(matches):
+            print("%s: %s  %s  %s%s" % (
+                h, "d" if isdir else "f", human(size or 0), match,
+                "/" if isdir else ""))
+        return
+    if target and _entry_only:
+        parent, _, name = path.rpartition("/")
+        rows = cd.execute(
+            "SELECT host,is_dir,size FROM dir_index WHERE parent=? AND name=?"
+            " AND (? IS NULL OR host=?) ORDER BY host", (parent, name, host, host)).fetchall()
+        cmain.close()
+        cd.close()
+        if not rows:
+            print("(no match: %s)" % target)
+        for h, isdir, size in rows:
+            print("%s: %s  %s  %s%s" % (
+                h, "d" if isdir else "f", human(size or 0), path,
+                "/" if isdir else ""))
+        return
     hosts = [host] if host else [r[0] for r in cmain.execute(
         "SELECT DISTINCT host_name FROM sessions WHERE host_name IS NOT NULL"
         " ORDER BY host_name")]
@@ -2714,8 +2829,9 @@ def cmd_remove(ctx, args):
     verify = "--verify-tape" in opts
     mtime = "--mtime" in opts
     args = [a for a in opts
-            if a not in ("--yes", "-y", "--prune-dirs", "--verify-tape",
-                         "--mtime")] + literals
+             if a not in ("--yes", "-y", "--prune-dirs", "--verify-tape",
+                          "--mtime")]
+    args = _local_patterns(args) + literals
     # tier: tape read-back > checksum (default) > mtime (explicit opt-in)
     need_sum = not verify and not mtime
     if not args:

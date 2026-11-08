@@ -18,6 +18,30 @@ tapebackup remove [--yes] [--mtime|--verify-tape] PATH...   # see warning
 
 Global flags: `-n/--dry-run`, `-j/--jobs N` (before the command).
 
+## Paths and patterns
+
+Paths starting with `./` or `../` are relative to the current working
+directory. For index commands, paths without a leading `/` or `./` refer to
+root-relative archive names, even when the original files no longer exist.
+Indexed paths remain stored without a leading `/`.
+
+`write` and `remove` accept shell-expanded paths and quoted local patterns,
+for example `tapebackup write './project*'`. Unmatched local patterns fail
+without operating on any paths. `extract`, `ls`, and `versions` also accept
+quoted patterns against the index, e.g.
+`tapebackup extract -C /restore './project/*.txt'`. In those commands `*` and `?` match within a single path
+component, and hidden names require a leading `.` in that component. Extract
+patterns match indexed files, not directory trees. `find` retains substring
+search and also accepts shell-style wildcard patterns. Quote patterns when
+searching the index, so the shell does not expand them against local files.
+`ls` with a pattern, or with multiple paths, lists the matched entries
+themselves rather than the contents of matched directories. To browse a
+directory, pass it as a single path without a pattern.
+
+Use `--` before literal `write`, `remove`, or `extract` paths that contain
+wildcard characters and should not be expanded. Always review `remove` without
+`--yes` before allowing deletion.
+
 ## ⚠️ WARNING — YOUR DATA IS PRECIOUS
 
 This tool writes to, erases and verifies **tape media**, and `remove`
