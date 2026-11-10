@@ -84,6 +84,71 @@ The tape drive is driven over SSH (`TAPEBACKUP_RHOST`, `TAPEBACKUP_RPORT`,
 checksums are computed from the exact tar stream that is written, and the
 index block is committed to the tape after the data chunk.
 
+### Experimental Windows read-only probe
+
+`windows_tape_probe.py` runs on Windows with Python 3 and uses read-only SCSI
+INQUIRY, READ ATTRIBUTE and LOG SENSE commands to report the drive identity,
+MAM cartridge identity and LTO capacity log as JSON:
+
+```powershell
+python windows_tape_probe.py --device '\\.\Tape0'
+```
+
+Opening the tape device may require administrator privileges and the Windows
+tape driver must support SCSI pass-through. The program opens the device with
+read/write access as required by the Windows pass-through interface, but does
+not issue write, erase or media-load commands. The default probe does not move
+tape. Do not run it concurrently with other tape software.
+
+The experimental `--sample MEMBER --file-number N --expected-id ID` mode
+rewinds and spaces to a 1-based tape file, then streams one regular tar member
+to binary stdout using SCSI READ(6). Capture stdout with a binary-safe process
+API and compare its size and SHA-256 with the index; discard output on any error.
+It requires at least a 1 MiB adapter transfer limit and fails closed on SCSI
+check conditions (including truncated records and filemarks). This is not a
+general recovery reader. Windows writing and interrupted-session recovery are
+not implemented.
+
+#### Restore through the main CLI
+
+Run the main CLI on Linux (where the index lives) with the Windows reader next
+to the `tapebackup` script. Python 3 must be available as `python` on Windows:
+
+```bash
+mkdir -p /path/to/restore
+TAPEBACKUP_BACKEND=windows \
+TAPEBACKUP_RHOST=192.168.1.44 TAPEBACKUP_RUSER=chang TAPEBACKUP_RJUMP=gw \
+  ./tapebackup extract -C /path/to/restore --sid SESSION_ID -- home/user/file
+```
+
+Omit `TAPEBACKUP_RJUMP` when no SSH jump host is needed. `TAPEBACKUP_WINDEV`
+defaults to `\\.\Tape0`. The helper is sent over SSH automatically; it does not
+need installing on Windows. SSH host keys must already be trusted.
+
+The Windows backend supports explicit regular-file paths and quoted index
+globs, with optional `--sid`/`--at`, for committed single-volume sessions with
+backup-time SHA-256. It restores file contents into root-relative paths under
+`-C`, verifies both byte count and hash, and publishes each file only after
+verification. Existing destination files are refused. It currently reads one
+file at a time, rewinding for each; directory/session-wide extraction, metadata
+restoration, multi-volume archives, and `--run` extraction are not supported.
+Use `-n` before `extract` to inspect the plan without accessing the tape.
+Other Windows tape operations are blocked; index queries remain available.
+
+On 2026-11-10, five randomly selected indexed files across tape files
+54, 66, 144 and 170 were restored through this CLI; all five passed size and
+SHA-256 verification, including an independent post-restore check.
+
+On the tested HP OEM QLogic 2532 with `ql2300` 9.2.5.20, `MaximumSGList=255`
+did not raise the 512 KiB limit. After backing up the registry, setting the
+`DriverParameter` string to `ts=5;` under
+`HKLM\SYSTEM\CurrentControlSet\Services\ql2300\Parameters\Device` and rebooting
+raised the reported limit to 1048576 bytes / 257 physical pages. This is a
+version-specific observation, not a universal driver setting; preserve any
+existing driver parameters. `ReadFile` still failed on this setup, while SCSI
+READ(6) restored a 150165-byte sample from tape file 116 whose SHA-256 matched
+the backup index (2026-11-10). No driver upgrade was needed.
+
 ## License
 
 GNU General Public License v3.0 — see [LICENSE](LICENSE).

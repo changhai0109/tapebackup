@@ -57,7 +57,7 @@ class PathTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.object(tb, "db_open", side_effect=lambda ctx: sqlite3.connect(db)), \
                  contextlib.redirect_stdout(output):
-                tb.cmd_extract(types.SimpleNamespace(dry=True), ["-C", d, "gone/*.txt"])
+                tb.cmd_extract(types.SimpleNamespace(dry=True, backend="linux"), ["-C", d, "gone/*.txt"])
             self.assertEqual(output.getvalue().count("[dry-run] would seek"), 2)
 
     def test_ls_glob_and_multiple_args_list_entries_not_children(self):

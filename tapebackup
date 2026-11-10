@@ -312,6 +312,9 @@ class Ctx:
         self.rport = os.environ.get("TAPEBACKUP_RPORT", "")
         self.ruser = os.environ.get("TAPEBACKUP_RUSER", "")
         self.rdev = os.environ.get("TAPEBACKUP_RDEV", "/dev/nst0")
+        self.backend = os.environ.get("TAPEBACKUP_BACKEND", "linux")
+        if self.backend not in ("linux", "windows"):
+            die("unknown TAPEBACKUP_BACKEND: %s" % self.backend)
         self.vol_kib = int(os.environ.get("TAPEBACKUP_VOL_KIB", DEFAULT_VOL_KIB))
         self.rmt = os.environ.get("TAPEBACKUP_RMT", "/usr/sbin/rmt")
         self.dry = dry
@@ -358,6 +361,8 @@ class Ctx:
             a += ["-p", str(self.rport)]
         if self.ruser:
             a += ["-l", self.ruser]
+        if os.environ.get("TAPEBACKUP_RJUMP"):
+            a += ["-J", os.environ["TAPEBACKUP_RJUMP"]]
         a.append(self.rhost)
         return a
 
@@ -1856,6 +1861,75 @@ def cmd_find(ctx, args):
             tape or "-", path, mts))
 
 
+def windows_extract(ctx, dest, sid, tapes, paths):
+    """Restore indexed regular files through the Windows read-only helper."""
+    if not ctx.rhost:
+        die("Windows extraction requires TAPEBACKUP_RHOST")
+    if len(tapes) != 1:
+        die("Windows extraction does not yet support multi-volume sessions")
+    if not paths:
+        die("Windows extraction currently requires explicit file paths or globs")
+    c = db_open(ctx)
+    try:
+        status = c.execute("SELECT status FROM sessions WHERE sid=?", (sid,)).fetchone()
+        if not status or status[0] != 1:
+            die("Windows extraction requires a committed session")
+        rows = []
+        root = os.path.realpath(dest)
+        for path in paths:
+            row = c.execute("SELECT size,sum FROM file_index WHERE sid=? AND path=?",
+                            (sid, path)).fetchone()
+            if not row or not row[1] or not re.fullmatch(r"[0-9a-fA-F]{64}", row[1]):
+                die("Windows extraction requires an indexed SHA-256: %s" % path)
+            if path.startswith("/") or any(p in ("", ".", "..") for p in path.split("/")):
+                die("unsafe archive path: %s" % path)
+            target = os.path.join(root, path)
+            if os.path.commonpath([root, os.path.realpath(target)]) != root:
+                die("restore path escapes destination: %s" % path)
+            if os.path.lexists(target):
+                die("Windows extraction refuses to overwrite: %s" % target)
+            rows.append((path, target, row[0], row[1].lower()))
+    finally:
+        c.close()
+    if ctx.dry:
+        for path, target, size, digest in rows:
+            print("[dry-run] Windows read %s file %d: %s -> %s (SHA-256 verified)" %
+                  (tapes[0][1], tapes[0][2], path, target))
+        return
+    helper = os.path.join(os.path.dirname(os.path.realpath(SELF)), "windows_tape_probe.py")
+    with open(helper, encoding="utf-8") as f:
+        source = f.read()
+    for path, target, size, digest in rows:
+        parent = os.path.dirname(target)
+        os.makedirs(parent, exist_ok=True)
+        fd, temp = tempfile.mkstemp(prefix=".tapebackup-", dir=parent)
+        try:
+            # Arguments travel as Python data on stdin, never through a remote shell.
+            argv = ["windows_tape_probe.py", "--device",
+                    os.environ.get("TAPEBACKUP_WINDEV", r"\\.\Tape0"),
+                    "--sample", path, "--file-number", str(tapes[0][2]),
+                    "--expected-id", tapes[0][1]]
+            script = "import sys\nsys.argv = %r\n" % argv + source
+            print("Windows restoring %s (tape file %d)" % (path, tapes[0][2]), flush=True)
+            with os.fdopen(fd, "wb") as output:
+                r = subprocess.run(ctx.ssh_argv_stream() + ["python -"],
+                                   input=script.encode("utf-8"), stdout=output)
+            if r.returncode:
+                die("Windows reader failed (%d): %s" % (r.returncode, path))
+            h = hashlib.sha256()
+            with open(temp, "rb") as f:
+                for block in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(block)
+            if os.path.getsize(temp) != size or h.hexdigest() != digest:
+                die("restored size/SHA-256 mismatch: %s" % path)
+            # Publish only verified files, without clobbering existing output.
+            os.link(temp, target)
+            print("verified SHA-256: %s" % path, flush=True)
+        finally:
+            os.unlink(temp)
+    print("extracted %d verified file(s) into %s" % (len(rows), dest))
+
+
 def cmd_extract(ctx, args):
     dest = None
     sid = None
@@ -1900,6 +1974,8 @@ def cmd_extract(ctx, args):
         paths = expanded
     paths = list(dict.fromkeys(paths + literal_paths))
     if runid:
+        if ctx.backend == "windows":
+            die("Windows extraction currently uses file paths with optional --sid/--at, not --run")
         rows = c.execute(
             "SELECT s.sid, st.tape, st.file_no FROM sessions s"
             " JOIN session_tapes st ON st.sid=s.sid AND st.seq=1"
@@ -1983,6 +2059,8 @@ def cmd_extract(ctx, args):
     c.close()
     if not tapes:
         die("session has no tape records")
+    if ctx.backend == "windows":
+        return windows_extract(ctx, dest, sid, tapes, paths)
     first_file = tapes[0][2]
     if ctx.dry:
         print("[dry-run] would seek to file %d of tape %s and tar -x %d file(s)"
@@ -3106,6 +3184,9 @@ def main():
                 (a.startswith("-j") and a[2:].isdigit()):
             die("-j/--jobs is a global flag: put it before '%s'" % cmd)
     ctx = Ctx(dry=dry)
+    if ctx.backend == "windows" and cmd not in (
+            "extract", "find", "ls", "versions", "runs", "tapes", "sessions"):
+        die("Windows backend supports extract and index queries only")
     if jobs is not None:
         ctx.jobs = max(1, jobs)
     try:
