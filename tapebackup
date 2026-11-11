@@ -20,6 +20,9 @@
 #   TAPEBACKUP_RPORT     ssh port for remote host
 #   TAPEBACKUP_RUSER     ssh user
 #   TAPEBACKUP_RDEV      remote device, default /dev/nst0
+#   TAPEBACKUP_BACKEND   linux (default) or experimental windows
+#   TAPEBACKUP_RJUMP     optional SSH jump host
+#   TAPEBACKUP_WINDEV    Windows tape device, default \\.\Tape0
 #   TAPEBACKUP_VOL_KIB   per-volume size for tar -L (KiB), default 2400000
 
 import argparse
@@ -1714,6 +1717,15 @@ def cmd_write(ctx, args):
 
 
 def cmd_resume(ctx, args):
+    if ctx.backend == "windows":
+        if ctx.jobs != 1:
+            die("Windows resume requires one worker")
+        helper = os.path.join(os.path.dirname(os.path.realpath(SELF)), "windows_backup.py")
+        argv = [sys.executable, helper] + (["--dry-run"] if ctx.dry else []) + args
+        result = subprocess.run(argv)
+        if result.returncode:
+            die("Windows resume stopped (%d); inspect its journals before retrying" % result.returncode)
+        return
     opts, literals = _split_literal(args)
     force = "--force" in opts
     opts = [a for a in opts if a not in ("--force",)]
@@ -3093,6 +3105,7 @@ Commands:
   check [TAPE]                read-verify recorded archives
   resume RUN_ID [--force] [--rate MBps] [--cooldown SEC]
                               continue an interrupted chunked run
+                              Windows: resume --help for explicit EOD options
   runs                        list runs (chunked backup sets)
   erase [-y] [--force] [--long]   ERASE tape and delete its sessions from index
   forget --tape CID [--force]     remove a tape's sessions from THIS index only
@@ -3185,8 +3198,8 @@ def main():
             die("-j/--jobs is a global flag: put it before '%s'" % cmd)
     ctx = Ctx(dry=dry)
     if ctx.backend == "windows" and cmd not in (
-            "extract", "find", "ls", "versions", "runs", "tapes", "sessions"):
-        die("Windows backend supports extract and index queries only")
+            "extract", "resume", "find", "ls", "versions", "runs", "tapes", "sessions"):
+        die("Windows backend supports extract, resume and index queries only")
     if jobs is not None:
         ctx.jobs = max(1, jobs)
     try:
